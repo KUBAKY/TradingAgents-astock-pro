@@ -42,22 +42,53 @@ _ENV_KEYS = {
 }
 
 
-from web.llm_keys import render_api_key_input  # noqa: E402
+from web.llm_keys import get_pref, render_api_key_input, set_pref  # noqa: E402
+
+_PROVIDERS_ST = ["anthropic", "deepseek", "minimax", "qwen", "glm", "openai_compatible"]
+_DEFAULT_MODELS = {
+    "anthropic": "claude-haiku-4-5", "deepseek": "deepseek-chat",
+    "minimax": "MiniMax-M2.7", "qwen": "qwen-plus", "glm": "glm-4",
+    "openai_compatible": "",
+}
+
+if "st_provider_idx" not in st.session_state:
+    saved_p = get_pref("ST_PROVIDER", "anthropic")
+    st.session_state["st_provider_idx"] = _PROVIDERS_ST.index(saved_p) if saved_p in _PROVIDERS_ST else 0
+if "st_model" not in st.session_state:
+    st.session_state["st_model"] = get_pref("ST_MODEL")
+if "st_base_url" not in st.session_state:
+    st.session_state["st_base_url"] = get_pref("ST_BASE_URL")
 
 with st.sidebar:
     st.header("LLM 设置")
-    provider = st.selectbox("Provider", ["anthropic", "deepseek", "minimax", "qwen", "glm", "openai_compatible"], index=0)
-    _DEFAULT_MODELS = {
-        "anthropic": "claude-haiku-4-5", "deepseek": "deepseek-chat",
-        "minimax": "MiniMax-M2.7", "qwen": "qwen-plus", "glm": "glm-4",
-        "openai_compatible": "",
-    }
-    model = st.text_input("Model", value=_DEFAULT_MODELS.get(provider, ""))
-    base_url = st.text_input("Base URL（可选）", value="") or None
+
+    def _on_provider_change():
+        p = _PROVIDERS_ST[st.session_state["st_provider_idx"]]
+        set_pref("ST_PROVIDER", p)
+        st.session_state["st_model"] = _DEFAULT_MODELS.get(p, "")
+        set_pref("ST_MODEL", st.session_state["st_model"])
+
+    provider_idx = st.selectbox(
+        "Provider", range(len(_PROVIDERS_ST)),
+        format_func=lambda i: _PROVIDERS_ST[i],
+        key="st_provider_idx",
+        on_change=_on_provider_change,
+    )
+    provider = _PROVIDERS_ST[provider_idx]
+
+    model = st.text_input(
+        "Model", key="st_model",
+        placeholder=_DEFAULT_MODELS.get(provider, ""),
+        on_change=lambda: set_pref("ST_MODEL", st.session_state["st_model"]),
+    ) or _DEFAULT_MODELS.get(provider, "")
+    base_url = st.text_input(
+        "Base URL（可选）", key="st_base_url",
+        on_change=lambda: set_pref("ST_BASE_URL", st.session_state["st_base_url"]),
+    ) or None
 
     render_api_key_input(provider, "stpage")
 
-    st.caption(f"短线决策单节点：**{provider} · {model or _DEFAULT_MODELS.get(provider)}**"
+    st.caption(f"短线决策单节点：**{provider} · {model}**"
                + (f"（{base_url}）" if base_url else ""))
     if provider == "anthropic":
         st.caption("anthropic 走 requests 直连（绕开 headroom-proxy 的 httpx 502）")

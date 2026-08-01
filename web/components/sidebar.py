@@ -10,7 +10,7 @@ import streamlit as st
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.checkpointer import clear_checkpoint
 from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
-from web.llm_keys import key_status, mask_key, render_api_key_input
+from web.llm_keys import get_pref, key_status, mask_key, render_api_key_input, set_pref
 from web.history import (
     clear_incomplete_task,
     get_history,
@@ -136,12 +136,26 @@ def _render_analysis_controls(raw_ticker: str, trade_date_value: date) -> None:
 def _render_llm_config() -> None:
     """Render LLM provider and model selection controls."""
 
+    # 跨会话持久化：首次渲染时从 .env 恢复上次选择
+    if "llm_provider_idx" not in st.session_state:
+        saved = get_pref("APP_LLM_PROVIDER", "minimax")
+        st.session_state["llm_provider_idx"] = (
+            _PROVIDER_KEYS.index(saved) if saved in _PROVIDER_KEYS else 0
+        )
+    if "llm_base_url" not in st.session_state:
+        st.session_state["llm_base_url"] = get_pref("APP_BASE_URL") or get_pref("BACKEND_URL")
+
     provider_idx = st.selectbox(
         "LLM 供应商",
         range(len(_PROVIDERS)),
         format_func=lambda i: _PROVIDER_DISPLAY[i],
         key="llm_provider_idx",
-        help="选择你配置了 API Key 的供应商",
+        help="选择你配置了 API Key 的供应商（选择会自动保存，刷新不回默认）",
+        on_change=lambda: (
+            set_pref("APP_LLM_PROVIDER", _PROVIDER_KEYS[st.session_state["llm_provider_idx"]]),
+            st.session_state.pop("quick_model_idx", None),
+            st.session_state.pop("deep_model_idx", None),
+        ),
     )
     provider_key = _PROVIDER_KEYS[provider_idx]
     st.session_state["llm_provider"] = provider_key
@@ -157,12 +171,20 @@ def _render_llm_config() -> None:
         deep_labels = [label for label, _ in deep_options]
         deep_values = [value for _, value in deep_options]
 
+        if "quick_model_idx" not in st.session_state or st.session_state["quick_model_idx"] >= len(quick_options):
+            saved_q = get_pref("APP_QUICK_MODEL")
+            st.session_state["quick_model_idx"] = quick_values.index(saved_q) if saved_q in quick_values else 0
+        if "deep_model_idx" not in st.session_state or st.session_state["deep_model_idx"] >= len(deep_options):
+            saved_d = get_pref("APP_DEEP_MODEL")
+            st.session_state["deep_model_idx"] = deep_values.index(saved_d) if saved_d in deep_values else 0
+
         quick_idx = st.selectbox(
             "快速思考模型",
             range(len(quick_options)),
             format_func=lambda i: quick_labels[i],
             key="quick_model_idx",
             help="用于常规分析任务，速度优先",
+            on_change=lambda: set_pref("APP_QUICK_MODEL", quick_values[st.session_state["quick_model_idx"]]),
         )
         st.session_state["quick_think_llm"] = quick_values[quick_idx]
 
@@ -172,6 +194,7 @@ def _render_llm_config() -> None:
             format_func=lambda i: deep_labels[i],
             key="deep_model_idx",
             help="用于辩论/决策等需要深度推理的任务",
+            on_change=lambda: set_pref("APP_DEEP_MODEL", deep_values[st.session_state["deep_model_idx"]]),
         )
         st.session_state["deep_think_llm"] = deep_values[deep_idx]
     else:
@@ -185,6 +208,7 @@ def _render_llm_config() -> None:
         "API Base URL（第三方/代理" + ("·必填" if base_url_required else "，可选") + "）",
         key="llm_base_url",
         placeholder="例: https://your-relay.example/v1",
+        on_change=lambda: set_pref("APP_BASE_URL", st.session_state["llm_base_url"]),
         help=(
             "通过第三方中转/代理访问模型时填写网关地址；留空则用所选供应商的官方地址。"
             "API Key 仍从 .env 读取，每个供应商用各自的环境变量——"

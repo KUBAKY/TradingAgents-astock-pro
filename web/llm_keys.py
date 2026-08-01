@@ -62,6 +62,17 @@ def save_env_key(env_name: str, value: str):
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def get_pref(name: str, default: str = "") -> str:
+    """读取持久化偏好（.env / 环境变量）。"""
+    return os.environ.get(name, default)
+
+
+def set_pref(name: str, value: str):
+    """写入偏好：立即生效 + 持久化到 .env。"""
+    os.environ[name] = value
+    save_env_key(name, value)
+
+
 def render_api_key_input(provider: str, widget_prefix: str):
     """显式状态 + 空输入框（不回填完整key）+ 变更即生效并写 .env。"""
     env_name, current = key_status(provider)
