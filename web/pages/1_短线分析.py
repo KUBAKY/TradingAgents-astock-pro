@@ -18,6 +18,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 from tradingagents.shortterm import pipeline, screener  # noqa: E402
+from web.shortterm_jobs import clear_job, get_job, latest_job_id, start_job  # noqa: E402
 
 st.set_page_config(page_title="短线分析", page_icon="⚡", layout="wide")
 
@@ -123,16 +124,31 @@ with tab_stock:
         if not ticker.strip():
             st.error("请输入股票代码")
         else:
-            with st.spinner("分析中（Ch0扫描 → 数据包 → LLM决策）..."):
-                try:
-                    result = pipeline.run(
-                        ticker.strip(), trade_date, intent, capital, cost, shares,
-                        provider, model or "claude-haiku-4-5", base_url, ch0_only,
-                    )
-                    st.session_state["st_result"] = result
-                except Exception as e:
-                    st.error(f"分析失败: {e}")
-    if st.session_state.get("st_result"):
+            job_id = start_job(
+                "stock",
+                lambda: pipeline.run(
+                    ticker.strip(), trade_date, intent, capital, cost, shares,
+                    provider, model or "claude-haiku-4-5", base_url, ch0_only,
+                ),
+            )
+            st.session_state["stock_job"] = job_id
+            st.session_state.pop("st_result", None)
+
+    job = get_job(st.session_state.get("stock_job", "")) or get_job(latest_job_id("stock") or "") or {}
+    status = job.get("status")
+    if status in ("queued", "running"):
+        st.info("分析中（Ch0扫描 → 数据包 → LLM决策）… 可切换页面，任务不中断")
+        import time as _t
+        _t.sleep(2)
+        st.rerun()
+    elif status == "error":
+        st.error(f"分析失败: {job['error']}")
+        if st.button("清除", key="stock_clear"):
+            clear_job(st.session_state.pop("stock_job", latest_job_id("stock") or ""))
+            st.rerun()
+    elif status == "done":
+        show_result(job["result"])
+    elif st.session_state.get("st_result"):
         show_result(st.session_state["st_result"])
 
 with tab_screen:
@@ -142,19 +158,35 @@ with tab_screen:
     s_no_llm = st.checkbox("只输出扫描JSON（不调LLM）", value=False, key="s_nollm")
 
     if st.button("开始扫描", type="primary", key="screen_run"):
-        with st.spinner("全市场扫描中（约1-2分钟：快照→粗排→Ch0精扫→LLM推荐）..."):
-            try:
-                scan_result = screener.scan(s_capital, per_board)
-                if s_no_llm:
-                    st.session_state["sc_result"] = ("json", scan_result)
-                else:
-                    text = screener.recommend(scan_result, provider, model or "claude-haiku-4-5", base_url)
-                    st.session_state["sc_result"] = ("report", text, scan_result)
-            except Exception as e:
-                st.error(f"扫描失败: {e}")
+        def _screen():
+            scan_result = screener.scan(s_capital, per_board)
+            if s_no_llm:
+                return ("json", scan_result)
+            text = screener.recommend(scan_result, provider, model or "claude-haiku-4-5", base_url)
+            return ("report", text, scan_result)
 
-    sc = st.session_state.get("sc_result")
-    if sc:
+        job_id = start_job("screen", _screen)
+        st.session_state["screen_job"] = job_id
+        st.session_state.pop("sc_result", None)
+
+    sjob = get_job(st.session_state.get("screen_job", "")) or get_job(latest_job_id("screen") or "") or {}
+    sstatus = sjob.get("status")
+    if sstatus in ("queued", "running"):
+        st.info("全市场扫描中（约1-2分钟）… 可切换页面，任务不中断")
+        import time as _t
+        _t.sleep(3)
+        st.rerun()
+    elif sstatus == "error":
+        st.error(f"扫描失败: {sjob['error']}")
+        if st.button("清除", key="screen_clear"):
+            clear_job(st.session_state.pop("screen_job", latest_job_id("screen") or ""))
+            st.rerun()
+    elif sstatus == "done":
+        sc = sjob["result"]
+    else:
+        sc = st.session_state.get("sc_result")
+
+    if sstatus == "done" or st.session_state.get("sc_result"):
         if sc[0] == "json":
             st.json(sc[1])
         else:
