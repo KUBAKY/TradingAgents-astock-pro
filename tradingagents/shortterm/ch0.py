@@ -313,7 +313,7 @@ def run_ch0(ticker: str, trade_date: str) -> dict[str, Any]:
     if turnover is None and not df.empty:
         data_gaps.append("float_shares(换手率无法计算)")
     if not df.empty and str(df["Date"].iloc[-1])[:10] < trade_date:
-        data_gaps.append("回测模式下换手率为近似值（流通股按当前值）")
+        data_gaps.append("换手率为近似值（流通股按当前值）")
 
     lhb_10d = count_lhb_appearances(code, trade_date, 10)
     if lhb_10d < 0:
