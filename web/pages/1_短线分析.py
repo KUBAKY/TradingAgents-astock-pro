@@ -18,6 +18,13 @@ if str(_PROJECT_ROOT) not in sys.path:
 load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 from tradingagents.shortterm import pipeline, screener  # noqa: E402
+from web.shortterm_history import (  # noqa: E402
+    evaluate_call,
+    list_records,
+    load_record,
+    save_screen_record,
+    save_stock_record,
+)
 from web.shortterm_jobs import clear_job, get_job, latest_job_id, start_job  # noqa: E402
 
 st.set_page_config(page_title="短线分析", page_icon="⚡", layout="wide")
@@ -93,7 +100,7 @@ with st.sidebar:
     if provider == "anthropic":
         st.caption("anthropic 走 requests 直连（绕开 headroom-proxy 的 httpx 502）")
 
-tab_stock, tab_screen = st.tabs(["个股决策", "全市场选股"])
+tab_stock, tab_screen, tab_hist = st.tabs(["个股决策", "全市场选股", "历史复盘"])
 
 
 def show_result(result: dict):
@@ -134,13 +141,16 @@ with tab_stock:
         if not ticker.strip():
             st.error("请输入股票代码")
         else:
-            job_id = start_job(
-                "stock",
-                lambda: pipeline.run(
+            def _stock():
+                res = pipeline.run(
                     ticker.strip(), trade_date, intent, capital, cost, shares,
                     provider, model or "claude-haiku-4-5", base_url, ch0_only,
-                ),
-            )
+                )
+                save_stock_record(res, {"intent": intent, "capital": capital,
+                                        "cost": cost, "shares": shares})
+                return res
+
+            job_id = start_job("stock", _stock)
             st.session_state["stock_job"] = job_id
             st.session_state.pop("st_result", None)
 
@@ -171,8 +181,10 @@ with tab_screen:
         def _screen():
             scan_result = screener.scan(s_capital, per_board)
             if s_no_llm:
+                save_screen_record(scan_result, None)
                 return ("json", scan_result)
             text = screener.recommend(scan_result, provider, model or "claude-haiku-4-5", base_url)
+            save_screen_record(scan_result, text)
             return ("report", text, scan_result)
 
         job_id = start_job("screen", _screen)
@@ -204,3 +216,52 @@ with tab_screen:
             with st.expander("候选池原始数据"):
                 st.json(sc[2])
             st.download_button("下载推荐 (md)", sc[1], file_name="screener.md")
+
+with tab_hist:
+    records = list_records()
+    if not records:
+        st.caption("暂无短线历史记录（个股决策/选股完成后自动落盘）")
+    else:
+        from datetime import datetime as _dt
+
+        def _label(r):
+            t = _dt.fromtimestamp(r["ts"]).strftime("%m-%d %H:%M")
+            if r["kind"] == "screen":
+                return f"[选股] {r['trade_date']} {t}"
+            d = (r.get("parsed") or {}).get("direction") or r.get("mode") or "?"
+            return f"[{d}] {r['trade_date']} {r.get('name','')}({r['ticker']}) {t}"
+
+        options = {_label(r): r["path"] for r in records}
+        sel = st.selectbox("选择记录", list(options.keys()))
+        rec = load_record(options[sel])
+
+        if rec["kind"] == "screen":
+            if rec.get("report"):
+                st.markdown(rec["report"])
+            with st.expander("扫描原始数据"):
+                st.json(rec["scan"])
+        else:
+            parsed = rec.get("parsed") or {}
+            with st.spinner("计算事后走势…"):
+                try:
+                    ev = evaluate_call(rec)
+                except Exception as e:
+                    ev = None
+                    st.warning(f"事后评估失败: {e}")
+            if ev:
+                cols = st.columns(6)
+                cols[0].metric("方向", parsed.get("direction") or "未解析")
+                cols[1].metric("基准收盘", ev.get("entry_close"))
+                cols[2].metric("T+1收盘", f"{ev['t1_close_pct']}%" if ev.get("t1_close_pct") is not None else "—")
+                cols[3].metric("T+3收盘", f"{ev['t3_close_pct']}%" if ev.get("t3_close_pct") is not None else "—")
+                cols[4].metric("T+10收盘", f"{ev['t10_close_pct']}%" if ev.get("t10_close_pct") is not None else "—")
+                verdict = ev.get("verdict", "—")
+                cols[5].metric("判定", verdict)
+                if ev.get("verdict_basis"):
+                    st.caption(f"判定依据: {ev['verdict_basis']}（后续K线 {ev.get('bars_after')} 根）")
+            st.markdown(rec.get("report", ""))
+            with st.expander("Ch0 扫描原始数据"):
+                st.json(rec["ch0"])
+            if rec.get("bundle"):
+                with st.expander("数据包原文"):
+                    st.text(rec["bundle"])

@@ -100,10 +100,10 @@ def run(ticker: str, trade_date: str, intent: str = "", capital: float | None = 
         for h in ch0["blacklist"]:
             report_lines.append(f"- **{h['level'].upper()}**: {h['rule']} — {h['evidence']}")
         report_lines.append(f"\n{ch0['action']}")
-        return {"ch0": ch0, "mode": "blacklist", "report": "\n".join(report_lines)}
+        return {"ch0": ch0, "mode": "blacklist", "report": "\n".join(report_lines), "bundle": None}
 
     if ch0_only:
-        return {"ch0": ch0, "mode": "ch0_only", "report": json.dumps(ch0, ensure_ascii=False, indent=2)}
+        return {"ch0": ch0, "mode": "ch0_only", "report": json.dumps(ch0, ensure_ascii=False, indent=2), "bundle": None}
 
     mode = ch0["mode_hint"]["mode"]
     bundle = gather_data_bundle(ticker, trade_date, mode if mode in ("swing", "ultra_short") else "swing")
@@ -133,7 +133,7 @@ def run(ticker: str, trade_date: str, intent: str = "", capital: float | None = 
     resp = llm.invoke(prompt)
     report = resp.content if hasattr(resp, "content") else str(resp)
 
-    return {"ch0": ch0, "mode": mode, "report": report}
+    return {"ch0": ch0, "mode": mode, "report": report, "bundle": bundle}
 
 
 def main():
