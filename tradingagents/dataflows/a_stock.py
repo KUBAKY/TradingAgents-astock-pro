@@ -1628,17 +1628,26 @@ def get_northbound_flow(
 
             hgt_close = float(hgt[-1]) if hgt else 0
             sgt_close = float(sgt[-1]) if sgt else 0
-            total = hgt_close + sgt_close
-            lines.append(
-                f"\nClose: HGT(沪股通)={hgt_close:.2f}亿 "
-                f"SGT(深股通)={sgt_close:.2f}亿 "
-                f"Total={total:.2f}亿"
-            )
-            if total > 0:
-                lines.append("Signal: Net northbound INFLOW (bullish)")
-            elif total < 0:
-                lines.append("Signal: Net northbound OUTFLOW (bearish)")
-            got_realtime = True
+            # 合理性校验：单日北向净流入历史上极少超过 ±300亿，超出视为接口异常值
+            NB_SANITY_LIMIT = 300.0
+            if abs(hgt_close) > NB_SANITY_LIMIT or abs(sgt_close) > NB_SANITY_LIMIT:
+                lines.append(
+                    f"\n⚠ 数据异常: HGT={hgt_close:.2f} / SGT={sgt_close:.2f} 超出 ±{NB_SANITY_LIMIT:.0f}亿 "
+                    f"合理区间，疑似接口返回累计值或错误值，本次数据不可用作交易依据"
+                )
+                got_realtime = False
+            else:
+                total = hgt_close + sgt_close
+                lines.append(
+                    f"\nClose: HGT(沪股通)={hgt_close:.2f}亿 "
+                    f"SGT(深股通)={sgt_close:.2f}亿 "
+                    f"Total={total:.2f}亿"
+                )
+                if total > 0:
+                    lines.append("Signal: Net northbound INFLOW (bullish)")
+                elif total < 0:
+                    lines.append("Signal: Net northbound OUTFLOW (bearish)")
+                got_realtime = True
         else:
             lines.append("No realtime data (non-trading hours or holiday)")
 
