@@ -24,6 +24,7 @@ import math
 import random
 import re as _re
 import socket
+import threading
 import time
 import uuid
 import urllib.request
@@ -96,18 +97,19 @@ def _build_name_code_map() -> tuple[dict[str, str], dict[str, str]]:
     c2n: dict[str, str] = {}
 
     try:
-        for market in (0, 1):  # 0=SZ, 1=SH
-            stocks = client.stocks(market=market)
-            if stocks is None or stocks.empty:
-                continue
-            for _, row in stocks.iterrows():
-                code = str(row["code"]).strip()
-                name = str(row["name"]).strip()
-                if not _re.match(r"^[036]\d{5}$", code):
+        with _MOOTDX_LOCK:
+            for market in (0, 1):  # 0=SZ, 1=SH
+                stocks = client.stocks(market=market)
+                if stocks is None or stocks.empty:
                     continue
-                clean_name = name.replace(" ", "").replace("　", "")
-                n2c[clean_name] = code
-                c2n[code] = clean_name
+                for _, row in stocks.iterrows():
+                    code = str(row["code"]).strip()
+                    name = str(row["name"]).strip()
+                    if not _re.match(r"^[036]\d{5}$", code):
+                        continue
+                    clean_name = name.replace(" ", "").replace("　", "")
+                    n2c[clean_name] = code
+                    c2n[code] = clean_name
     except Exception as e:
         # 网络抖动/通达信不可达时给出明确提示，而非冒泡成风马牛不相及的报错（#46/#66）
         raise ValueError(
@@ -283,6 +285,22 @@ _EM_SESSION.headers.update({"User-Agent": _UA})
 # 两次东财请求最小间隔(秒)；批量多 Agent 场景可设环境变量 EM_MIN_INTERVAL=1.5~2 降速。
 _EM_MIN_INTERVAL = float(os.environ.get("EM_MIN_INTERVAL", "1.0"))
 _em_last_call = [0.0]  # 模块级上次东财请求时间戳
+_EM_LOCK = threading.Lock()  # 节流时间戳无线程保护 → 锁内 sleep+请求，东财调用全局串行
+# mootdx client 是模块级单例 TCP 连接（_get_mootdx_client），非线程安全；
+# 并发扫描（screener 线程池）共用一条连接会交错收发 → 所有 client 调用点串行化。
+_MOOTDX_LOCK = threading.Lock()
+# 熔断：mootdx 故障（超时/空数据，常见于周末/海外网络）后冷却期内跳过直连，
+# 避免批量扫描时每票串行支付 ~16s 超时。冷却 300s 后自动重试。
+_MOOTDX_DEAD_UNTIL = [0.0]
+_MOOTDX_BREAKER_TTL = 300.0
+
+
+def _mootdx_alive() -> bool:
+    return time.time() >= _MOOTDX_DEAD_UNTIL[0]
+
+
+def _trip_mootdx_breaker() -> None:
+    _MOOTDX_DEAD_UNTIL[0] = time.time() + _MOOTDX_BREAKER_TTL
 
 
 def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
@@ -292,15 +310,16 @@ def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
     串行限流：与上次东财请求间隔 < EM_MIN_INTERVAL 时 sleep 补足 + 0.1~0.5s 随机抖动。
     传入的 headers 会覆盖 session 默认 UA（用于保留各端点自己的 Referer/Origin）。
     """
-    wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
-    if wait > 0:
-        time.sleep(wait + random.uniform(0.1, 0.5))
-    try:
-        return _EM_SESSION.get(
-            url, params=params, headers=headers, timeout=timeout, **kwargs
-        )
-    finally:
-        _em_last_call[0] = time.time()
+    with _EM_LOCK:
+        wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.1, 0.5))
+        try:
+            return _EM_SESSION.get(
+                url, params=params, headers=headers, timeout=timeout, **kwargs
+            )
+        finally:
+            _em_last_call[0] = time.time()
 
 
 def _eastmoney_datacenter(
@@ -310,13 +329,14 @@ def _eastmoney_datacenter(
     page_size: int = 50,
     sort_columns: str = "",
     sort_types: str = "-1",
+    page: int = 1,
 ) -> list[dict]:
     """东财数据中心统一查询 — 龙虎榜/解禁 共用."""
     params = {
         "reportName": report_name,
         "columns": columns,
         "filter": filter_str,
-        "pageNumber": "1",
+        "pageNumber": str(page),
         "pageSize": str(page_size),
         "sortColumns": sort_columns,
         "sortTypes": sort_types,
@@ -504,31 +524,42 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
             return data[data["Date"] <= cutoff]
 
     # Fetch from mootdx — 800 daily bars (~3 years of trading days)
-    try:
-        client = _get_mootdx_client()
-        df = client.bars(symbol=code, category=4, offset=800)
+    df = None
+    if _mootdx_alive():
+        try:
+            client = _get_mootdx_client()
+            with _MOOTDX_LOCK:
+                raw = client.bars(symbol=code, category=4, offset=800)
+        except Exception as e:
+            _trip_mootdx_breaker()
+            logger.warning("mootdx OHLCV failed for %s: %s (熔断%ds, 直连sina)",
+                           code, e, _MOOTDX_BREAKER_TTL)
+            raw = None
 
-        if df is None or df.empty:
-            raise ValueError(f"No OHLCV data from mootdx for {code}")
+        if raw is not None and not raw.empty:
+            # mootdx returns index named 'datetime' AND a column named 'datetime'
+            # (plus year/month/day/hour/minute/volume). Drop duplicates before reset.
+            df = raw.drop(columns=["datetime", "year", "month", "day", "hour", "minute"], errors="ignore")
+            df = df.reset_index()  # moves index 'datetime' → column 'datetime'
+            rename_map = {
+                "datetime": "Date",
+                "open": "Open",
+                "close": "Close",
+                "high": "High",
+                "low": "Low",
+                "volume": "Volume",
+            }
+            df = df.rename(columns=rename_map)
+            df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+            df = _normalize_ohlcv_dates(df)
+        else:
+            # 空数据视同故障（超时无异常返回None是 mootdx 典型失败模式）
+            _trip_mootdx_breaker()
+            logger.warning("mootdx OHLCV empty for %s (熔断%ds, 直连sina)",
+                           code, _MOOTDX_BREAKER_TTL)
 
-        # mootdx returns index named 'datetime' AND a column named 'datetime'
-        # (plus year/month/day/hour/minute/volume). Drop duplicates before reset.
-        df = df.drop(columns=["datetime", "year", "month", "day", "hour", "minute"], errors="ignore")
-        df = df.reset_index()  # moves index 'datetime' → column 'datetime'
-        rename_map = {
-            "datetime": "Date",
-            "open": "Open",
-            "close": "Close",
-            "high": "High",
-            "low": "Low",
-            "volume": "Volume",
-        }
-        df = df.rename(columns=rename_map)
-        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-        df = _normalize_ohlcv_dates(df)
-    except Exception as e:
-        logger.warning("mootdx OHLCV failed for %s: %s, trying sina HTTP fallback", code, e)
-        # Fallback: Sina direct HTTP API
+    if df is None or df.empty:
+        # Fallback: Sina direct HTTP API（mootdx 故障/熔断中）
         try:
             df = _sina_kline_fallback(code)
             if df.empty:
@@ -563,35 +594,43 @@ def get_stock_data(
     code = _normalize_ticker(symbol)
 
     data_source = "mootdx (TCP)"
-    try:
-        client = _get_mootdx_client()
-        df = client.bars(symbol=code, category=4, offset=800)
+    df = None
+    if _mootdx_alive():
+        try:
+            client = _get_mootdx_client()
+            with _MOOTDX_LOCK:
+                df = client.bars(symbol=code, category=4, offset=800)
 
-        if df is None or df.empty:
-            raise ValueError(f"No data from mootdx for {code}")
+            if df is None or df.empty:
+                raise ValueError(f"No data from mootdx for {code}")
 
-        # Drop duplicate datetime column + extra columns before reset_index
-        df = df.drop(
-            columns=["datetime", "year", "month", "day", "hour", "minute"],
-            errors="ignore",
-        )
-        df = df.reset_index()  # index 'datetime' → column 'datetime'
-        df = df.rename(
-            columns={
-                "datetime": "Date",
-                "open": "Open",
-                "close": "Close",
-                "high": "High",
-                "low": "Low",
-                "volume": "Volume",
-                "amount": "Amount",
-            }
-        )
-        df = _normalize_ohlcv_dates(df)
+            # Drop duplicate datetime column + extra columns before reset_index
+            df = df.drop(
+                columns=["datetime", "year", "month", "day", "hour", "minute"],
+                errors="ignore",
+            )
+            df = df.reset_index()  # index 'datetime' → column 'datetime'
+            df = df.rename(
+                columns={
+                    "datetime": "Date",
+                    "open": "Open",
+                    "close": "Close",
+                    "high": "High",
+                    "low": "Low",
+                    "volume": "Volume",
+                    "amount": "Amount",
+                }
+            )
+            df = _normalize_ohlcv_dates(df)
 
-    except Exception as e:
-        logger.warning("mootdx K-line failed for %s: %s, trying sina HTTP fallback", code, e)
-        # Fallback: Sina direct HTTP API
+        except Exception as e:
+            _trip_mootdx_breaker()
+            logger.warning("mootdx K-line failed for %s: %s (熔断%ds), trying sina HTTP fallback",
+                           code, e, _MOOTDX_BREAKER_TTL)
+            df = None
+
+    if df is None or df.empty:
+        # Fallback: Sina direct HTTP API（mootdx 故障/熔断中）
         try:
             df = _sina_kline_fallback(code, start_date, end_date)
             if df.empty:
@@ -752,7 +791,8 @@ def get_fundamentals(
         # --- mootdx: financial snapshot (quarterly) ---
         try:
             client = _get_mootdx_client()
-            fin = client.finance(symbol=code)
+            with _MOOTDX_LOCK:
+                fin = client.finance(symbol=code)
             if fin is not None and not (
                 isinstance(fin, pd.DataFrame) and fin.empty
             ):
@@ -1308,7 +1348,8 @@ def get_insider_transactions(
 
     try:
         client = _get_mootdx_client()
-        text = client.F10(symbol=code, name="股东研究")
+        with _MOOTDX_LOCK:
+            text = client.F10(symbol=code, name="股东研究")
 
         if not text or not text.strip():
             return f"No insider/shareholder data found for A-stock '{code}'"

@@ -3,14 +3,17 @@
 import pandas as pd
 import pytest
 
+import tradingagents.shortterm.ch0 as ch0_mod
 from tradingagents.shortterm.ch0 import (
     check_blacklist,
     classify_mcap,
     compute_price_metrics,
     compute_recent_bars,
+    count_lhb_batch,
     decide_mode,
     detect_board,
     detect_limit_streak,
+    run_ch0,
     scan_anomalies,
 )
 
@@ -236,3 +239,73 @@ class TestDecideMode:
     def test_swing_default(self):
         m = decide_mode([{"type": "volume", "signal": "x"}], {"ret_7d_pct": 5}, 0)
         assert m["mode"] == "swing"
+
+
+class TestCountLhbBatch:
+    def test_counts_and_paging(self, monkeypatch):
+        pages = {
+            1: [{"SECURITY_CODE": "600001"}, {"SECURITY_CODE": "600001"},
+                {"SECURITY_CODE": "600002"}, {"SECURITY_CODE": "999999"}] * 125,  # 500行 → 翻页
+            2: [{"SECURITY_CODE": "600002"}],  # <500 → 停止
+        }
+        calls = []
+
+        def fake_dc(report, columns="ALL", filter_str="", page_size=50,
+                    sort_columns="", sort_types="-1", page=1):
+            calls.append(page)
+            return pages.get(page, [])
+        monkeypatch.setattr(ch0_mod, "_eastmoney_datacenter", fake_dc)
+
+        out = count_lhb_batch(["600001", "600002", "600003"], "2026-08-01", 10)
+        assert out == {"600001": 250, "600002": 126, "600003": 0}
+        assert calls == [1, 2]
+
+    def test_failure_returns_none(self, monkeypatch):
+        def boom(**kw):
+            raise RuntimeError("net")
+        monkeypatch.setattr(ch0_mod, "_eastmoney_datacenter", boom)
+        assert count_lhb_batch(["600001"], "2026-08-01") is None
+
+
+class TestRunCh0Injection:
+    def _mock_base(self, monkeypatch):
+        df = _df([10.0 + i * 0.05 for i in range(60)], start="2026-05-01")
+        monkeypatch.setattr(ch0_mod, "_load_ohlcv_astock", lambda c, d: df)
+
+    def test_injected_quote_skips_tencent(self, monkeypatch):
+        self._mock_base(monkeypatch)
+
+        def tencent_boom(codes):
+            raise RuntimeError("不应被调用")
+        monkeypatch.setattr(ch0_mod, "_tencent_quote", tencent_boom)
+        monkeypatch.setattr(ch0_mod, "count_lhb_appearances", lambda *a: 0)
+
+        out = run_ch0("600001", "2026-08-01",
+                      quote={"name": "测试股", "price": 10.0,
+                             "mcap_yi": 100.0, "float_mcap_yi": 70.0},
+                      lhb_count=3)
+        assert out["verdict"] == "PASS"
+        assert out["name"] == "测试股"
+        assert out["lhb_appearances_10d"] == 3
+        assert "tencent_quote" not in out["data_gaps"]
+
+    def test_zero_lhb_count_not_refetched(self, monkeypatch):
+        self._mock_base(monkeypatch)
+        monkeypatch.setattr(ch0_mod, "_tencent_quote",
+                            lambda codes: {"600001": {"name": "x", "mcap_yi": 100.0}})
+
+        def lhb_boom(*a):
+            raise RuntimeError("不应被调用")
+        monkeypatch.setattr(ch0_mod, "count_lhb_appearances", lhb_boom)
+
+        out = run_ch0("600001", "2026-08-01", lhb_count=0)
+        assert out["lhb_appearances_10d"] == 0
+
+    def test_none_falls_back_to_per_ticker(self, monkeypatch):
+        self._mock_base(monkeypatch)
+        monkeypatch.setattr(ch0_mod, "_tencent_quote",
+                            lambda codes: {"600001": {"name": "x", "mcap_yi": 100.0}})
+        monkeypatch.setattr(ch0_mod, "count_lhb_appearances", lambda *a: 5)
+
+        out = run_ch0("600001", "2026-08-01")
+        assert out["lhb_appearances_10d"] == 5

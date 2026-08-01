@@ -11,8 +11,9 @@ def _row(code, name="测试股", mcap_yi=100.0, amount=5.0):
     return {
         "code": code, "name": name, "price": 10.0, "chg_pct": 3.0,
         "turnover_pct": 8.0, "vol_ratio": 2.0, "amount_yi": amount,
-        "mcap_yi": mcap_yi, "main_net_inflow_yi": 0.5,
-        "main_net_inflow_pct": 1.2, "industry": "半导体",
+        "mcap_yi": mcap_yi, "float_mcap_yi": mcap_yi * 0.7,
+        "main_net_inflow_yi": 0.5, "main_net_inflow_pct": 1.2,
+        "industry": "半导体",
     }
 
 
@@ -61,8 +62,10 @@ class TestScanRejected:
             screener, "fetch_board_merged",
             lambda board: [_row(f"{board}000{i}") for i in range(len(ch0_by_code))],
         )
+        monkeypatch.setattr(screener, "count_lhb_batch", lambda codes, d, days: None)
+        monkeypatch.setattr(screener, "_concept_tags", lambda code: "半导体/芯片")
 
-        def fake_ch0(code, trade_date):
+        def fake_ch0(code, trade_date, **kw):
             idx = int(code[-1])
             outcome = ch0_by_code[idx]
             if isinstance(outcome, Exception):
@@ -129,3 +132,51 @@ class TestRecommendPrompt:
         assert "200,000" in prompt
         # JSON 结构合法
         assert json.loads(prompt.split("候选池 JSON：")[1].split("已剔除列表 JSON：")[0])
+
+
+class TestQuoteFromSnapshot:
+    def test_maps_ch0_fields(self):
+        q = screener._quote_from_snapshot(_row("600001"))
+        assert q == {"name": "测试股", "price": 10.0,
+                     "mcap_yi": 100.0, "float_mcap_yi": 70.0}
+
+
+class TestScanConcurrency:
+    def test_lhb_batch_and_concepts_wired(self, monkeypatch):
+        calls = {}
+
+        monkeypatch.setattr(screener, "fetch_board_merged",
+                            lambda board: [_row(f"{board}0000")])
+        monkeypatch.setattr(screener, "run_ch0",
+                            lambda code, d, **kw: _ch0_pass())
+
+        def fake_batch(codes, trade_date, days):
+            calls["batch"] = codes
+            return {c: 2 for c in codes}
+        monkeypatch.setattr(screener, "count_lhb_batch", fake_batch)
+        monkeypatch.setattr(screener, "_concept_tags",
+                            lambda c: calls.setdefault("concepts", []).append(c) or "标签")
+
+        result = screener.scan(per_board=5)
+        for board in screener.BOARD_FS:
+            assert calls["batch"]  # 批量 LHB 被调用
+            assert result["boards"][board][0]["concepts"] == "标签"
+            assert result["boards"][board][0]["ch0"]["lhb_10d"] == 1  # fake ch0 返回值
+
+    def test_lhb_batch_failure_falls_back(self, monkeypatch):
+        seen = {}
+
+        monkeypatch.setattr(screener, "fetch_board_merged",
+                            lambda board: [_row(f"{board}0000")])
+        monkeypatch.setattr(screener, "count_lhb_batch", lambda *a: None)
+
+        def fake_ch0(code, trade_date, quote=None, lhb_count=None):
+            seen["lhb_count"] = lhb_count
+            seen["quote"] = quote
+            return _ch0_pass()
+        monkeypatch.setattr(screener, "run_ch0", fake_ch0)
+        monkeypatch.setattr(screener, "_concept_tags", lambda c: "")
+
+        screener.scan(per_board=5)
+        assert seen["lhb_count"] is None  # 批量失败 → 逐票回退
+        assert seen["quote"]["name"] == "测试股"  # 快照 quote 注入生效

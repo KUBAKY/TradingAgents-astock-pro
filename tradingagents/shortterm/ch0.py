@@ -298,19 +298,54 @@ def count_lhb_appearances(code: str, trade_date: str, days: int = 10) -> int:
         return -1  # 查询失败
 
 
+def count_lhb_batch(codes: list[str], trade_date: str, days: int = 10) -> dict[str, int] | None:
+    """批量统计多票近 days 天龙虎榜上榜次数：整段榜单一次拉取，本地按 code 计数。
+
+    逐票查询要 N 次限流调用（screener 24-45 票 → 30-60s），批量只需 2-3 次。
+    失败返回 None（调用方应回退逐票查询）。
+    """
+    start = (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
+    counts: dict[str, int] = {c: 0 for c in codes}
+    wanted = set(codes)
+    page = 1
+    try:
+        while True:
+            data = _eastmoney_datacenter(
+                "RPT_DAILYBILLBOARD_DETAILSNEW",
+                filter_str=f"(TRADE_DATE>='{start}')(TRADE_DATE<='{trade_date}')",
+                page_size=500,
+                page=page,
+            )
+            if not data:
+                break
+            for row in data:
+                code = row.get("SECURITY_CODE")
+                if code in wanted:
+                    counts[code] += 1
+            if len(data) < 500:
+                break
+            page += 1
+        return counts
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 
-def run_ch0(ticker: str, trade_date: str) -> dict[str, Any]:
+def run_ch0(ticker: str, trade_date: str,
+            quote: dict | None = None, lhb_count: int | None = None) -> dict[str, Any]:
+    """quote/lhb_count 为可选预取注入（screener 批量场景消除逐票请求）；None 时走原有逐票获取。"""
     code = _normalize_ticker(ticker)
     data_gaps: list[str] = []
 
-    quote: dict = {}
-    try:
-        quote = _tencent_quote([code]).get(code, {})
-    except Exception:
-        data_gaps.append("tencent_quote")
+    if quote is None:
+        quote = {}
+        try:
+            quote = _tencent_quote([code]).get(code, {})
+        except Exception:
+            data_gaps.append("tencent_quote")
 
     name = quote.get("name", "")
     board = detect_board(code, name)
@@ -344,7 +379,10 @@ def run_ch0(ticker: str, trade_date: str) -> dict[str, Any]:
     if not df.empty and str(df["Date"].iloc[-1])[:10] < trade_date:
         data_gaps.append("换手率为近似值（流通股按当前值）")
 
-    lhb_10d = count_lhb_appearances(code, trade_date, 10)
+    if lhb_count is None:
+        lhb_10d = count_lhb_appearances(code, trade_date, 10)
+    else:
+        lhb_10d = lhb_count
     if lhb_10d < 0:
         data_gaps.append("dragon_tiger_board")
 
