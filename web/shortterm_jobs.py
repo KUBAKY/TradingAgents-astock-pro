@@ -10,6 +10,7 @@ import uuid
 _JOBS: dict[str, dict] = {}
 _LATEST: dict[str, str] = {}  # kind -> job_id，跨页面/跨会话找回任务
 _LOCK = threading.Lock()
+_MAX_JOBS_PER_KIND = 20  # FIFO 上限，防长期使用内存膨胀
 
 
 def _set(job_id: str, **kw):
@@ -43,6 +44,10 @@ def start_job(kind: str, fn) -> str:
     with _LOCK:
         _JOBS[job_id] = {"kind": kind, "status": "queued"}
         _LATEST[kind] = job_id
+        # FIFO: dict 插入有序，同 kind 超出上限时删最旧
+        ids = [j for j, v in _JOBS.items() if v.get("kind") == kind]
+        for old in ids[:-_MAX_JOBS_PER_KIND]:
+            _JOBS.pop(old, None)
     threading.Thread(target=_run, args=(job_id, fn), daemon=True).start()
     return job_id
 

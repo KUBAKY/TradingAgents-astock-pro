@@ -120,6 +120,9 @@ def show_result(result: dict):
     st.markdown(result["report"])
     with st.expander("Ch0 扫描原始数据"):
         st.json(ch0)
+    if result.get("bundle"):
+        with st.expander("数据包原文（喂给 LLM 的原始数据）"):
+            st.text(result["bundle"])
     st.download_button("下载报告 (md)", result["report"],
                        file_name=f"{ch0['ticker']}_{ch0['trade_date']}_shortterm.md")
 
@@ -128,7 +131,21 @@ with tab_stock:
     c1, c2, c3 = st.columns(3)
     ticker = c1.text_input("股票代码", value="", placeholder="如 000725")
     trade_date = c2.date_input("分析日期", value=date.today()).strftime("%Y-%m-%d")
-    intent = c3.text_input("你的诉求（可选）", placeholder="如：连板想追 / 被套要不要割")
+    intent = c3.text_input("你的诉求（可选）", key="intent_input",
+                           placeholder="如：连板想追 / 被套要不要割")
+
+    def _set_intent(txt):
+        st.session_state["intent_input"] = txt
+
+    chips = st.columns(4)
+    chips[0].button("连板想追", key="chip_chase", on_click=_set_intent,
+                    args=("连板想追高，评估能否介入、什么条件下介入",))
+    chips[1].button("被套要不要割", key="chip_stuck", on_click=_set_intent,
+                    args=("已持仓被套，明确回答割/持/补三选一及理由",))
+    chips[2].button("打板候选", key="chip_board", on_click=_set_intent,
+                    args=("准备打板介入，评估次日溢价概率与风险",))
+    chips[3].button("低吸机会", key="chip_dip", on_click=_set_intent,
+                    args=("想找回踩低吸点，评估关键支撑位与介入信号",))
 
     c4, c5, c6 = st.columns(3)
     capital = c4.number_input("总资金（元）", min_value=0, value=0, step=10000) or None
@@ -157,10 +174,16 @@ with tab_stock:
     job = get_job(st.session_state.get("stock_job", "")) or get_job(latest_job_id("stock") or "") or {}
     status = job.get("status")
     if status in ("queued", "running"):
-        st.info("分析中（Ch0扫描 → 数据包 → LLM决策）… 可切换页面，任务不中断")
-        import time as _t
-        _t.sleep(2)
-        st.rerun()
+        # 仅运行期挂载轮询 fragment：完成后 app 级 rerun 落回静态分支，空闲零 churn
+        @st.fragment(run_every=2)
+        def _poll_stock():
+            j = get_job(st.session_state.get("stock_job", "")) or get_job(latest_job_id("stock") or "") or {}
+            if j.get("status") in ("queued", "running"):
+                st.info("分析中（Ch0扫描 → 数据包 → LLM决策）… 可切换页面，任务不中断")
+            else:
+                st.rerun()
+
+        _poll_stock()
     elif status == "error":
         st.error(f"分析失败: {job['error']}")
         if st.button("清除", key="stock_clear"):
@@ -191,24 +214,7 @@ with tab_screen:
         st.session_state["screen_job"] = job_id
         st.session_state.pop("sc_result", None)
 
-    sjob = get_job(st.session_state.get("screen_job", "")) or get_job(latest_job_id("screen") or "") or {}
-    sstatus = sjob.get("status")
-    if sstatus in ("queued", "running"):
-        st.info("全市场扫描中（约1-2分钟）… 可切换页面，任务不中断")
-        import time as _t
-        _t.sleep(3)
-        st.rerun()
-    elif sstatus == "error":
-        st.error(f"扫描失败: {sjob['error']}")
-        if st.button("清除", key="screen_clear"):
-            clear_job(st.session_state.pop("screen_job", latest_job_id("screen") or ""))
-            st.rerun()
-    elif sstatus == "done":
-        sc = sjob["result"]
-    else:
-        sc = st.session_state.get("sc_result")
-
-    if sstatus == "done" or st.session_state.get("sc_result"):
+    def _render_screen_result(sc):
         if sc[0] == "json":
             st.json(sc[1])
         else:
@@ -216,6 +222,29 @@ with tab_screen:
             with st.expander("候选池原始数据"):
                 st.json(sc[2])
             st.download_button("下载推荐 (md)", sc[1], file_name="screener.md")
+
+    sjob = get_job(st.session_state.get("screen_job", "")) or get_job(latest_job_id("screen") or "") or {}
+    sstatus = sjob.get("status")
+    if sstatus in ("queued", "running"):
+        # 仅运行期挂载轮询 fragment：完成后 app 级 rerun 落回静态分支，空闲零 churn
+        @st.fragment(run_every=3)
+        def _poll_screen():
+            j = get_job(st.session_state.get("screen_job", "")) or get_job(latest_job_id("screen") or "") or {}
+            if j.get("status") in ("queued", "running"):
+                st.info("全市场扫描中（约1分钟）… 可切换页面，任务不中断")
+            else:
+                st.rerun()
+
+        _poll_screen()
+    elif sstatus == "error":
+        st.error(f"扫描失败: {sjob['error']}")
+        if st.button("清除", key="screen_clear"):
+            clear_job(st.session_state.pop("screen_job", latest_job_id("screen") or ""))
+            st.rerun()
+    elif sstatus == "done":
+        _render_screen_result(sjob["result"])
+    elif st.session_state.get("sc_result"):
+        _render_screen_result(st.session_state["sc_result"])
 
 with tab_hist:
     records = list_records()
