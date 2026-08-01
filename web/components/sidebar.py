@@ -10,6 +10,7 @@ import streamlit as st
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.checkpointer import clear_checkpoint
 from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
+from web.llm_keys import key_status, mask_key, render_api_key_input
 from web.history import (
     clear_incomplete_task,
     get_history,
@@ -145,6 +146,8 @@ def _render_llm_config() -> None:
     provider_key = _PROVIDER_KEYS[provider_idx]
     st.session_state["llm_provider"] = provider_key
 
+    render_api_key_input(provider_key, "appsidebar")
+
     if provider_key in MODEL_OPTIONS:
         quick_options = MODEL_OPTIONS[provider_key]["quick"]
         deep_options = MODEL_OPTIONS[provider_key]["deep"]
@@ -242,6 +245,26 @@ def _render_llm_config() -> None:
                 "父进程保留它，是为了让 `anthropic` 仍能作为撞额度后的降级 provider。"
                 "如果你并不打算保留付费降级，可在 .env 里清掉它。"
             )
+
+    # ── 当前生效配置：哪个节点用哪个模型 ──────────────────────────────
+    env_name, cur_key = key_status(provider_key)
+    key_label = f"{env_name}（{mask_key(cur_key)}）" if cur_key else f"{env_name} 未配置"
+    scope = st.session_state.get("subscription_scope", "off")
+    quick_m = st.session_state.get("quick_think_llm", "?")
+    deep_m = st.session_state.get("deep_think_llm", "?")
+    sub_m = st.session_state.get("agent_sdk_model", "opus")
+    rows = [
+        ("7个分析师 / 多空辩论 / 交易员 / 风险辩手",
+         f"claude_agent_sdk · sonnet" if scope == "all" else f"{provider_key} · {quick_m}"),
+        ("Research Manager / Portfolio Manager",
+         f"claude_agent_sdk · {sub_m}" if scope in ("deep", "all") else f"{provider_key} · {deep_m}"),
+    ]
+    table = "\n".join(f"| {n} | {m} |" for n, m in rows)
+    st.markdown(
+        f"**当前生效配置**\n\n"
+        f"| 节点 | 供应商 · 模型 |\n|---|---|\n{table}\n\n"
+        f"Key 状态：{key_label}"
+    )
 
 
 def render_sidebar() -> None:

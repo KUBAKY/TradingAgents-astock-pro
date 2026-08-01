@@ -42,18 +42,7 @@ _ENV_KEYS = {
 }
 
 
-def _save_env_key(key_name: str, value: str):
-    env_path = _PROJECT_ROOT / ".env"
-    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-    prefix = f"{key_name}="
-    for i, line in enumerate(lines):
-        if line.startswith(prefix):
-            lines[i] = f"{prefix}{value}"
-            break
-    else:
-        lines.append(f"{prefix}{value}")
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
+from web.llm_keys import render_api_key_input  # noqa: E402
 
 with st.sidebar:
     st.header("LLM 设置")
@@ -66,22 +55,12 @@ with st.sidebar:
     model = st.text_input("Model", value=_DEFAULT_MODELS.get(provider, ""))
     base_url = st.text_input("Base URL（可选）", value="") or None
 
-    key_name = _ENV_KEYS[provider]
-    api_key = st.text_input(
-        f"API Key（{key_name}）", type="password",
-        value=os.environ.get(key_name, ""),
-        help="仅保存在本机。勾选下方保存则写入项目根目录 .env，重启后免输",
-    )
-    if api_key:
-        os.environ[key_name] = api_key
-    if api_key and st.checkbox("保存 API Key 到 .env"):
-        _save_env_key(key_name, api_key)
-        st.success(f"已写入 .env 的 {key_name}")
+    render_api_key_input(provider, "stpage")
 
-    has_key = bool(os.environ.get(key_name))
-    if not has_key:
-        st.warning(f"未检测到 {key_name}，分析会报 401")
-    st.caption("anthropic 走 requests 直连（绕开 headroom-proxy 的 httpx 502）")
+    st.caption(f"短线决策单节点：**{provider} · {model or _DEFAULT_MODELS.get(provider)}**"
+               + (f"（{base_url}）" if base_url else ""))
+    if provider == "anthropic":
+        st.caption("anthropic 走 requests 直连（绕开 headroom-proxy 的 httpx 502）")
 
 tab_stock, tab_screen = st.tabs(["个股决策", "全市场选股"])
 
