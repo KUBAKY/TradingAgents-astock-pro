@@ -362,6 +362,7 @@ def render_sidebar() -> None:
                 "fresh": True,
             }
             st.session_state["viewing_history"] = None
+            st.session_state["comparing_ticker"] = None
 
     _render_analysis_controls(ticker, trade_date)
 
@@ -393,6 +394,7 @@ def render_sidebar() -> None:
                     "trade_date": d,
                 }
                 st.session_state["viewing_history"] = None
+                st.session_state["comparing_ticker"] = None
 
     st.markdown("---")
     st.markdown("#### 历史记录")
@@ -408,6 +410,21 @@ def render_sidebar() -> None:
         if st.button(label, key=f"hist_{t}_{d}", use_container_width=True):
             st.session_state["viewing_history"] = entry["path"]
             st.session_state["start_analysis"] = None
+            st.session_state["comparing_ticker"] = None
+
+    # 同股多次分析 → 对比视图入口
+    from collections import Counter
+
+    counts = Counter(e["ticker"] for e in history)
+    multi = [t for t, n in counts.items() if n > 1]
+    if multi:
+        st.caption("同股多次分析：")
+        for t in multi[:5]:
+            if st.button(f"⇄ {t} 对比（{counts[t]}次）", key=f"cmp_{t}",
+                         use_container_width=True):
+                st.session_state["comparing_ticker"] = t
+                st.session_state["viewing_history"] = None
+                st.session_state["start_analysis"] = None
 
     st.markdown("---")
     st.caption("⚠️ 仅供学习研究，不构成投资建议")

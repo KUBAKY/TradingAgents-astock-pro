@@ -234,9 +234,44 @@ if start_req:
 
 tracker: ProgressTracker | None = st.session_state.get("tracker")
 viewing_history: str | None = st.session_state.get("viewing_history")
+comparing: str | None = st.session_state.get("comparing_ticker")
+
+# State 0.5: 同股多日对比视图
+if comparing:
+    from web.history import get_history
+
+    entries = sorted(
+        (e for e in get_history() if e["ticker"] == comparing),
+        key=lambda e: e["date"],
+    )
+    if len(entries) < 2:
+        st.session_state["comparing_ticker"] = None
+        st.rerun()
+    st.markdown(f"### ⇄ {comparing} 历史对比（{len(entries)} 次分析）")
+    loaded: dict[str, tuple[dict | None, str]] = {}
+    cols = st.columns(len(entries))
+    for col, entry in zip(cols, entries):
+        try:
+            st_state = load_analysis(entry["path"])
+            sig = extract_signal(st_state)
+        except Exception:
+            st_state, sig = None, "ERR"
+        loaded[entry["date"]] = (st_state, sig)
+        col.metric(entry["date"], sig)
+    date_sel = st.selectbox(
+        "查看某日完整报告", [e["date"] for e in entries], index=len(entries) - 1
+    )
+    sel_state, sel_sig = loaded[date_sel]
+    if sel_state is not None:
+        render_report(sel_state, comparing, date_sel, sel_sig)
+    else:
+        st.error(f"{date_sel} 报告加载失败")
+    if st.button("退出对比", key="exit_compare"):
+        st.session_state["comparing_ticker"] = None
+        st.rerun()
 
 # State 1: Viewing a historical analysis
-if viewing_history:
+elif viewing_history:
     try:
         state = load_analysis(viewing_history)
         signal = extract_signal(state)

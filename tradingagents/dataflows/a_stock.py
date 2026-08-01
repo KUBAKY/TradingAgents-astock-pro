@@ -1351,7 +1351,8 @@ def get_insider_transactions(
         with _MOOTDX_LOCK:
             text = client.F10(symbol=code, name="股东研究")
 
-        if not text or not text.strip():
+        # mootdx 故障时 F10 可能返回 dict（错误信息）而非 str → 防御性类型检查
+        if not isinstance(text, str) or not text.strip():
             return f"No insider/shareholder data found for A-stock '{code}'"
 
         header = f"# Shareholder Research for {code} (A-stock)\n"
