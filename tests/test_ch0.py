@@ -7,6 +7,7 @@ from tradingagents.shortterm.ch0 import (
     check_blacklist,
     classify_mcap,
     compute_price_metrics,
+    compute_recent_bars,
     decide_mode,
     detect_board,
     detect_limit_streak,
@@ -96,6 +97,59 @@ class TestPriceMetrics:
         vols = [100.0] * 9 + [500.0]
         m = compute_price_metrics(_df(closes * 3, vols * 3))
         assert m["vol_ratio_vs_5d"] == pytest.approx(5.0, rel=0.01)
+
+
+class TestRecentBars:
+    def test_length_capped_at_7(self):
+        m = compute_price_metrics(_df([10.0 + i * 0.1 for i in range(60)]))
+        assert len(m["recent_bars"]) == 7
+
+    def test_short_history_uses_all(self):
+        bars = compute_recent_bars(_df([10.0] * 5))
+        assert len(bars) == 4  # i 从 1 起（无前收），历史不足 n 时全用
+
+    def test_pct_chg_and_close_pos(self):
+        # 单调上涨、High=Close*1.01/Low=Close*0.99 → 每日 pct>0，收位固定
+        m = compute_price_metrics(_df([10.0 + i for i in range(30)]))
+        last = m["recent_bars"][-1]
+        assert last["pct_chg"] > 0
+        # Open=Close, High=C*1.01, Low=C*0.99 → 收位=(C-0.99C)/(0.02C)=0.5
+        assert last["close_pos"] == pytest.approx(0.5, abs=0.01)
+
+    def test_close_at_high_gives_pos_1(self):
+        dates = pd.date_range("2026-01-01", periods=3, freq="B")
+        df = pd.DataFrame({
+            "Date": dates,
+            "Open": [10.0, 10.0, 10.0],
+            "High": [10.0, 10.0, 11.0],
+            "Low": [10.0, 10.0, 10.0],
+            "Close": [10.0, 10.0, 11.0],  # 末根收在最高
+            "Volume": [100.0, 100.0, 100.0],
+        })
+        bars = compute_recent_bars(df)
+        assert bars[-1]["close_pos"] == 1.0
+        assert bars[-1]["upper_shadow_pct"] == 0.0
+
+    def test_long_upper_shadow_detected(self):
+        dates = pd.date_range("2026-01-01", periods=3, freq="B")
+        df = pd.DataFrame({
+            "Date": dates,
+            "Open": [10.0, 10.0, 10.0],
+            "High": [10.0, 10.0, 11.5],   # 冲高15%
+            "Low": [10.0, 10.0, 9.9],
+            "Close": [10.0, 10.0, 10.0],  # 回落至开盘=炸板形态
+            "Volume": [100.0, 100.0, 500.0],
+        })
+        bars = compute_recent_bars(df)
+        assert bars[-1]["upper_shadow_pct"] == pytest.approx(15.0, rel=0.01)
+        assert bars[-1]["close_pos"] < 0.1
+        assert bars[-1]["vol_ratio"] == pytest.approx(5.0, rel=0.01)
+
+    def test_metrics_include_recent_bars(self):
+        m = compute_price_metrics(_df([10.0 + i * 0.05 for i in range(40)]))
+        assert "recent_bars" in m
+        b = m["recent_bars"][-1]
+        assert set(b) == {"date", "pct_chg", "close_pos", "upper_shadow_pct", "vol_ratio"}
 
 
 class TestScanAnomalies:

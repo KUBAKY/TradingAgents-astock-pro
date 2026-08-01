@@ -85,6 +85,14 @@ def ch0_summary_block(ch0: dict) -> str:
     lines.append(f"- 波动率倍数: {m.get('volatility_multiple')} | 250日新高: {m.get('is_250d_high')} | 250日新低: {m.get('is_250d_low')}")
     ls = ch0.get("limit_streak", {})
     lines.append(f"- 连板: 涨停{ls.get('limit_up_streak')}天 / 跌停{ls.get('limit_down_streak')}天 | 龙虎榜近10日上榜: {ch0.get('lhb_appearances_10d')}次")
+    bars = m.get("recent_bars") or []
+    if bars:
+        lines.append("- 近7日K线形态（收位: 0=收最低 1=收最高；上影%/量比 对前5日）:")
+        for b in bars:
+            pct = f"{b['pct_chg']:+.2f}%" if b.get("pct_chg") is not None else "n/a"
+            us = f"{b['upper_shadow_pct']}%" if b.get("upper_shadow_pct") is not None else "n/a"
+            vr = b.get("vol_ratio") if b.get("vol_ratio") is not None else "n/a"
+            lines.append(f"  * {b['date']}: {pct} 收位{b.get('close_pos')} 上影{us} 量比{vr}")
     if ch0.get("anomalies"):
         lines.append("- 触发异动:")
         for a in ch0["anomalies"]:

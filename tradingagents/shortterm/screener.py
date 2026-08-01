@@ -133,6 +133,8 @@ def scan(capital: float | None = None, per_board: int = 8,
                 "mode": ch0["mode_hint"]["mode"],
                 "ret_7d_pct": ch0["metrics"].get("ret_7d_pct"),
                 "ret_30d_pct": ch0["metrics"].get("ret_30d_pct"),
+                "recent_pct_seq": [b.get("pct_chg") for b in
+                                   (ch0["metrics"].get("recent_bars") or [])[-5:]],
                 "limit_up_streak": ch0["limit_streak"]["limit_up_streak"],
                 "lhb_10d": ch0.get("lhb_appearances_10d", 0),
                 "data_gaps": ch0.get("data_gaps", []),

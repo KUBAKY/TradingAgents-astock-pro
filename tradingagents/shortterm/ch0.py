@@ -75,6 +75,34 @@ def classify_mcap(mcap_yi: float, board: str = "main") -> str:
 # 量价计算
 # ---------------------------------------------------------------------------
 
+def compute_recent_bars(df: pd.DataFrame, n: int = 7) -> list[dict[str, Any]]:
+    """末 n 根日K形态：供 LLM 识别断板/炸板/长上影/连续阳线。
+
+    每根: date/pct_chg(对前收)/close_pos(收盘位置 0=收最低 1=收最高)/
+    upper_shadow_pct(上影线相对前收%)/vol_ratio(对前5日均量)。
+    """
+    df = df.sort_values("Date").reset_index(drop=True)
+    close = df["Close"].astype(float)
+    vol = df["Volume"].astype(float)
+    out = []
+    for i in range(max(1, len(df) - n), len(df)):
+        row = df.iloc[i]
+        o, h, l, c = (float(row["Open"]), float(row["High"]),
+                      float(row["Low"]), float(row["Close"]))
+        prev_c = float(close.iloc[i - 1])
+        rng = h - l
+        prior5 = vol.iloc[max(0, i - 5):i]
+        prior5_mean = float(prior5.mean()) if len(prior5) else 0.0
+        out.append({
+            "date": str(row["Date"])[:10],
+            "pct_chg": round((c / prev_c - 1) * 100, 2) if prev_c else None,
+            "close_pos": round((c - l) / rng, 2) if rng > 0 else 0.5,
+            "upper_shadow_pct": round((h - max(o, c)) / prev_c * 100, 2) if prev_c else None,
+            "vol_ratio": round(float(vol.iloc[i]) / prior5_mean, 2) if prior5_mean > 0 else None,
+        })
+    return out
+
+
 def compute_price_metrics(df: pd.DataFrame) -> dict[str, Any]:
     """df: _load_ohlcv_astock 输出 (Date/Open/High/Low/Close/Volume)，已按日期过滤。"""
     df = df.sort_values("Date").reset_index(drop=True)
@@ -120,6 +148,7 @@ def compute_price_metrics(df: pd.DataFrame) -> dict[str, Any]:
         "volatility_multiple": round(vol20_ann / vol_hist_ann, 2) if vol_hist_ann > 0 else None,
         "is_250d_high": bool(last_close >= prev_250_high * 0.999),
         "is_250d_low": bool(last_close <= prev_250_low * 1.001),
+        "recent_bars": compute_recent_bars(df),
         "bars": len(df),
     }
 
