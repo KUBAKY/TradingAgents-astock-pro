@@ -180,3 +180,23 @@ def evaluate_call(record: dict, asof_date: str | None = None) -> dict[str, Any]:
     out["verdict"] = "对" if hit else "错"
     out["verdict_basis"] = f"{direction} vs T+3 收益 {r3:+.2f}%"
     return out
+
+
+def load_past_evaluations(ticker: str, before_date: str, n: int = 3) -> list[dict]:
+    """取该票最近 n 条个股决策记录 + 事后评估（评估基准日=before_date，防前视）。
+
+    v2 自校准注入用。任何单条失败静默跳过，不阻塞主流程。
+    """
+    out = []
+    for r in list_records(ticker=ticker, kind="stock"):
+        if not r.get("trade_date") or r["trade_date"] >= before_date:
+            continue
+        try:
+            full = load_record(r["path"])
+            ev = evaluate_call(full, asof_date=before_date)
+        except Exception:
+            continue
+        out.append({"record": full, "evaluation": ev})
+        if len(out) >= n:
+            break
+    return out

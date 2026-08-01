@@ -3,7 +3,7 @@
 import pandas as pd
 import pytest
 
-import web.shortterm_history as sh
+import tradingagents.shortterm.history as sh
 
 
 def _report(direction="买入", confidence="高"):
@@ -149,3 +149,65 @@ class TestEvaluateCall:
         rec["ch0"] = {"metrics": {}}
         ev = sh.evaluate_call(rec, asof_date="2026-07-06")
         assert ev["verdict"] == "不评分"
+
+
+class TestLoadPastEvaluations:
+    def _setup(self, monkeypatch):
+        summaries = [
+            {"path": "/p/1.json", "kind": "stock", "ticker": "000725",
+             "trade_date": "2026-07-05", "ts": 3},
+            {"path": "/p/2.json", "kind": "stock", "ticker": "000725",
+             "trade_date": "2026-07-01", "ts": 2},
+            {"path": "/p/3.json", "kind": "stock", "ticker": "000725",
+             "trade_date": "2026-06-20", "ts": 1},
+        ]
+        monkeypatch.setattr(sh, "list_records", lambda **kw: summaries)
+        monkeypatch.setattr(sh, "load_record",
+                            lambda p: {"ticker": "000725", "path": p,
+                                       "parsed": {"direction": "买入", "confidence": "高"}})
+        monkeypatch.setattr(sh, "evaluate_call",
+                            lambda rec, asof_date=None: {"verdict": "对", "verdict_basis": "x",
+                                                         "t3_close_pct": 5.0})
+        return summaries
+
+    def test_filters_and_caps(self, monkeypatch):
+        self._setup(monkeypatch)
+        out = sh.load_past_evaluations("000725", "2026-07-10", n=2)
+        assert len(out) == 2
+        assert out[0]["evaluation"]["verdict"] == "对"
+
+    def test_excludes_same_day_and_future(self, monkeypatch):
+        self._setup(monkeypatch)
+        out = sh.load_past_evaluations("000725", "2026-07-01")
+        assert len(out) == 1  # 只剩 06-20
+        assert out[0]["record"]["path"] == "/p/3.json"
+
+    def test_single_failure_skipped(self, monkeypatch):
+        self._setup(monkeypatch)
+        def boom(rec, asof_date=None):
+            raise RuntimeError("ohlcv fail")
+        monkeypatch.setattr(sh, "evaluate_call", boom)
+        assert sh.load_past_evaluations("000725", "2026-07-10") == []
+
+
+class TestHistoryBlock:
+    def test_empty(self):
+        from tradingagents.shortterm.prompts import history_block
+        assert history_block([]) == ""
+
+    def test_render(self):
+        from tradingagents.shortterm.prompts import history_block
+        past = [{
+            "record": {"trade_date": "2026-06-30",
+                       "parsed": {"direction": "买入", "confidence": "高"}},
+            "evaluation": {"verdict": "错", "verdict_basis": "买入 vs T+3 收益 -3.46%",
+                           "t1_close_pct": 1.04, "t3_close_pct": -3.46,
+                           "t10_close_pct": -19.12},
+        }]
+        block = history_block(past)
+        assert "2026-06-30" in block
+        assert "方向=买入" in block
+        assert "T+3 -3.46%" in block
+        assert "T+10 -19.12%" in block
+        assert "判定 错" in block
+        assert "上次错在哪" in block

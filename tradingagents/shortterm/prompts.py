@@ -104,3 +104,29 @@ def ch0_summary_block(ch0: dict) -> str:
         lines.append(f"- 数据缺失: {', '.join(ch0['data_gaps'])}（结论需降置信度）")
     lines.append(f"- 模式判定: {ch0['mode_hint']['label']} — {ch0['mode_hint']['reason']}")
     return "\n".join(lines)
+
+
+def history_block(past: list[dict]) -> str:
+    """v2 自校准块：渲染历史判断+事后验证，注入 prompt。空历史返回空串（prompt 零变化）。"""
+    if not past:
+        return ""
+    lines = ["## 你过去对该标的的判断及事后验证（先复盘上次对错，再给本次判断）"]
+    for item in past:
+        rec, ev = item["record"], item.get("evaluation")
+        parsed = rec.get("parsed") or {}
+        d = parsed.get("direction") or "未解析"
+        c = parsed.get("confidence") or "?"
+        line = f"- {rec['trade_date']}: 方向={d} 置信度={c}"
+        if ev:
+            if ev.get("t1_close_pct") is not None:
+                line += f" → T+1 {ev['t1_close_pct']:+.2f}%"
+            if ev.get("t3_close_pct") is not None:
+                line += f"，T+3 {ev['t3_close_pct']:+.2f}%"
+            if ev.get("t10_close_pct") is not None:
+                line += f"，T+10 {ev['t10_close_pct']:+.2f}%"
+            line += f"（判定 {ev.get('verdict')}: {ev.get('verdict_basis')}）"
+        lines.append(line)
+    lines.append(
+        "纪律：若上次判错，必须先回答'上次错在哪、漏了什么信号'，再给本次判断；"
+        "本次方向与历史判断不一致时，必须显式解释变化原因，禁止无解释反转。")
+    return "\n".join(lines)

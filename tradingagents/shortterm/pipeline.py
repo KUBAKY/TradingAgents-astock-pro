@@ -13,7 +13,8 @@ import os
 from datetime import datetime, timedelta
 
 from .ch0 import run_ch0
-from .prompts import QUICK_PROMPT, SWING_PROMPT, ULTRA_SHORT_PROMPT, ch0_summary_block
+from .history import load_past_evaluations
+from .prompts import QUICK_PROMPT, SWING_PROMPT, ULTRA_SHORT_PROMPT, ch0_summary_block, history_block
 
 
 def gather_data_bundle(ticker: str, trade_date: str, mode: str) -> str:
@@ -108,6 +109,14 @@ def run(ticker: str, trade_date: str, intent: str = "", capital: float | None = 
     mode = ch0["mode_hint"]["mode"]
     bundle = gather_data_bundle(ticker, trade_date, mode if mode in ("swing", "ultra_short") else "swing")
     ch0_block = ch0_summary_block(ch0)
+
+    # v2 自校准：注入该票历史判断+事后验证（无历史/失败 → 零变化）
+    try:
+        hist = history_block(load_past_evaluations(ch0["ticker"], trade_date))
+    except Exception:
+        hist = ""
+    if hist:
+        ch0_block += "\n\n" + hist
 
     extras = []
     if intent:

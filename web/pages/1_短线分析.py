@@ -18,7 +18,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 from tradingagents.shortterm import pipeline, screener  # noqa: E402
-from web.shortterm_history import (  # noqa: E402
+from tradingagents.shortterm.history import (  # noqa: E402
     evaluate_call,
     list_records,
     load_record,
