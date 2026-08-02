@@ -188,7 +188,7 @@ def scan(capital: float | None = None, per_board: int = 8,
 
 SCREENER_PROMPT = """你是A股短线选股顾问（v2：打分横评版）。以下是程序化三级扫描后的候选池（三排序键合并快照→活跃度粗排→黑名单/异动精扫）。用户资金 {capital} 元。
 
-候选池字段说明：main_net_inflow_yi=当日主力净流入(亿元)，main_net_inflow_pct=主力净占比(%)，industry=行业板块，concepts=概念题材标签，ch0.anomalies=异动信号列表，ch0.overheated=过热标记，ch0.mode=模式提示(超短/波段)，ch0.ret_7d_pct/ret_30d_pct=近7/30日涨幅，ch0.limit_up_streak=连板数，ch0.lhb_10d=近10日龙虎榜次数，ch0.data_gaps=数据缺口（均为扫描时点实时快照）。
+候选池字段说明：main_net_inflow_yi=当日主力净流入(亿元)，main_net_inflow_pct=主力净占比(%)，industry=行业板块，concepts=概念题材标签，ch0.anomalies=异动信号列表，ch0.overheated=过热标记，ch0.mode=模式提示(超短/波段)，ch0.ret_7d_pct/ret_30d_pct=近7/30日涨幅，ch0.limit_up_streak=连板数，ch0.lhb_10d=近10日龙虎榜次数，ch0.data_gaps=数据缺口（均为扫描时点实时快照）。history=你过去对该票的判断及事后验证（date=判断日，direction=当时方向，t1_pct/t3_pct=事后T+1/T+3收益%，verdict=对/错；无记录或失败为空列表）。
 
 任务分四步：
 
@@ -213,6 +213,7 @@ SCREENER_PROMPT = """你是A股短线选股顾问（v2：打分横评版）。�
 - 标注 overheated=true 的票只能建议"等回踩"，不能建议追
 - 主力大幅净流出(main_net_inflow_yi 显著为负)且上涨的票，警惕出货，降一档处理
 - 数据缺失(data_gaps非空)的票降一档处理；lhb_10d=0 且无主力净流入的纯情绪票降一档
+- 该票 history 中近期判断多次判错（verdict=错 ≥2）或 T+3 持续为负的，说明上次错在哪、本次为何不同，否则降一档；history 为空的不额外加分
 - C级及以下票不进入操作计划；没有合适标的允许空仓，宁可缺不可滥
 - 所有价格建议用具体数字，禁止模糊表述（如"高开3%以上"→"高开3%+且竞价量≥昨日10%"）
 
@@ -224,11 +225,34 @@ SCREENER_PROMPT = """你是A股短线选股顾问（v2：打分横评版）。�
 """
 
 
+def _candidate_history(code: str, before_date: str) -> list[dict]:
+    """该票最近决策+事后验证（T+1/T+3/T+10 方向命中），防前视。失败返回空。
+
+    注入推荐 prompt，让选股顾问参考自己对该票的历史判断质量。
+    """
+    from .history import load_past_evaluations
+
+    out = []
+    for item in load_past_evaluations(code, before_date, n=3):
+        r, ev = item.get("record", {}), item.get("evaluation", {})
+        out.append({
+            "date": r.get("trade_date"),
+            "direction": ev.get("direction") or r.get("direction"),
+            "t1_pct": ev.get("t1_pct"),
+            "t3_pct": ev.get("t3_pct"),
+            "verdict": ev.get("verdict"),
+        })
+    return out
+
+
 def recommend(scan_result: dict, provider: str, model: str,
               base_url: str | None = None) -> str:
+    trade_date = scan_result["trade_date"]
     slim = {
-        "trade_date": scan_result["trade_date"],
-        "boards": scan_result["boards"],
+        "trade_date": trade_date,
+        "boards": {b: [{**row, "history": _candidate_history(row["code"], trade_date)}
+                       for row in rows]
+                   for b, rows in scan_result["boards"].items()},
     }
     prompt = (SCREENER_PROMPT
               .replace("{capital}", f"{scan_result['capital']:,.0f}" if scan_result.get("capital") else "未提供")
