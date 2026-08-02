@@ -1960,6 +1960,103 @@ def get_fund_flow(
 
 
 # ---------------------------------------------------------------------------
+# 14.5 Auction (集合竞价) — 09:15-09:25 竞价分时
+# ---------------------------------------------------------------------------
+# 数据源：东财 push2 details/get（分笔成交），pos=0 一次返回全天明细，
+# 含 09:15:00-09:25:00 集合竞价段（周六/非交易时段返回最近交易日完整数据，
+# 可在盘后复盘竞价行为）。09:25 最后一笔为集合竞价匹配价。
+_AUCTION_CACHE: dict[tuple[str, str], dict | None] = {}
+
+
+def get_auction_data(ticker: str, trade_date: str | None = None) -> dict | None:
+    """Get 集合竞价 auction ticks (09:15-09:25) from 东财 push2 分笔成交.
+
+    Args:
+        ticker: 6-digit A-share code.
+        trade_date: YYYY-MM-DD; defaults to today. Used for cache key only
+            (endpoint returns the latest trading session regardless).
+
+    Returns:
+        dict with keys:
+            date:        交易日期 (from prePrice context, best-effort)
+            preclose:    昨收价
+            open_px:     09:15:00 首笔竞价价
+            final_px:    09:25:00 集合竞价匹配价
+            open_pct:    首笔竞价 vs 昨收 涨幅(%)
+            final_pct:   匹配价 vs 昨收 涨幅(%)
+            high_px:     竞价区间最高价
+            low_px:      竞价区间最低价
+            vol:         09:15-09:25 累计竞价成交量(手)
+            final_vol:   09:25 匹配量(手)
+            ticks:       竞价笔数
+        or None on any failure (endpoint blocked / no auction segment).
+    """
+    code = _normalize_ticker(ticker)
+    if trade_date is None:
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+    key = (code, trade_date)
+    if key in _AUCTION_CACHE:
+        return _AUCTION_CACHE[key]
+
+    result: dict | None = None
+    try:
+        secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
+        url = "https://push2.eastmoney.com/api/qt/stock/details/get"
+        params = {
+            "secid": secid,
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62",
+            "pos": "0", "page": "1", "pageSize": "5000", "iscca": "0",
+        }
+        r = _em_get(url, params=params, timeout=10)
+        data = r.json().get("data") or {}
+        details = data.get("details") or []
+        preclose = float(data.get("prePrice") or 0)
+        if not details or preclose <= 0:
+            _AUCTION_CACHE[key] = None
+            return None
+
+        ticks: list[tuple[str, float, int]] = []
+        for row in details:
+            parts = row.split(",")
+            if len(parts) < 3:
+                continue
+            t = parts[0]
+            if not t or t > "09:25:00":
+                continue  # 竞价段截止 09:25；09:30 起为连续竞价
+            try:
+                ticks.append((t, float(parts[1]), int(float(parts[2]))))
+            except (ValueError, IndexError):
+                continue
+        if not ticks:
+            _AUCTION_CACHE[key] = None
+            return None
+
+        ticks.sort(key=lambda x: x[0])
+        prices = [p for _, p, _ in ticks]
+        vols = [v for _, _, v in ticks]
+        open_px, final_px = prices[0], prices[-1]
+        result = {
+            "date": trade_date,
+            "preclose": preclose,
+            "open_px": open_px,
+            "final_px": final_px,
+            "open_pct": round((open_px / preclose - 1) * 100, 2),
+            "final_pct": round((final_px / preclose - 1) * 100, 2),
+            "high_px": max(prices),
+            "low_px": min(prices),
+            "vol": sum(vols),
+            "final_vol": vols[-1],
+            "ticks": len(ticks),
+        }
+    except Exception:
+        result = None
+    _AUCTION_CACHE[key] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 15. Dragon Tiger Board (龙虎榜)
 # ---------------------------------------------------------------------------
 

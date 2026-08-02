@@ -386,6 +386,10 @@ def run_ch0(ticker: str, trade_date: str,
     if lhb_10d < 0:
         data_gaps.append("dragon_tiger_board")
 
+    auction = _collect_auction(code, trade_date)
+    if auction is False:
+        data_gaps.append("auction")
+
     anomalies = scan_anomalies(metrics, board, mcap_tier, turnover, limit)
     mode = decide_mode(anomalies, metrics, max(lhb_10d, 0))
 
@@ -404,8 +408,33 @@ def run_ch0(ticker: str, trade_date: str,
         "lhb_appearances_10d": max(lhb_10d, 0),
         "anomalies": anomalies,
         "mode_hint": mode,
+        "auction": auction or None,
         "data_gaps": data_gaps,
     }
+
+
+def _collect_auction(code: str, trade_date: str, now: datetime | None = None) -> dict | bool:
+    """采集集合竞价数据（仅当日 09:15-09:30 实时窗口内执行）。
+
+    窗口外返回 None（跳过，批量扫描零开销）；窗口内采集失败返回 False
+    （调用方记入 data_gaps）。返回 dict 结构见 get_auction_data，附 live=True。
+    """
+    if now is None:
+        now = datetime.now()
+    if trade_date != now.strftime("%Y-%m-%d"):
+        return None
+    hhmm = now.strftime("%H:%M")
+    if not ("09:15" <= hhmm < "09:30"):
+        return None
+    from tradingagents.dataflows.a_stock import get_auction_data
+    try:
+        d = get_auction_data(code, trade_date)
+    except Exception:
+        return False
+    if not d:
+        return False
+    d["live"] = True
+    return d
 
 
 if __name__ == "__main__":
