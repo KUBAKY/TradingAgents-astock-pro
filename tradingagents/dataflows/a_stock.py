@@ -1087,32 +1087,13 @@ def get_income_statement(
 # ---- 7. get_news ----
 
 
-def _fetch_news_eastmoney(code: str, page_size: int = 20) -> list[dict]:
-    """Direct East Money search API for individual stock news."""
+def _fetch_news_eastmoney(code: str, page_size: int = 20, max_pages: int = 3) -> list[dict]:
+    """Direct East Money search API for individual stock news.
+
+    分页翻取（pageIndex 循环）以覆盖历史日期窗口；搜索索引可能返回空
+    （周末/临时风控），返回空列表由调用方降级到新浪。
+    """
     url = "https://search-api-web.eastmoney.com/search/jsonp"
-    inner_param = {
-        "uid": "",
-        "keyword": code,
-        "type": ["cmsArticleWebOld"],
-        "client": "web",
-        "clientType": "web",
-        "clientVersion": "curr",
-        "param": {
-            "cmsArticleWebOld": {
-                "searchScope": "default",
-                "sort": "default",
-                "pageIndex": 1,
-                "pageSize": page_size,
-                "preTag": "",
-                "postTag": "",
-            }
-        },
-    }
-    params = {
-        "cb": "callback",
-        "param": _json.dumps(inner_param, ensure_ascii=False),
-        "_": "1",
-    }
     headers = {
         "Referer": "https://so.eastmoney.com/",
         "User-Agent": (
@@ -1121,31 +1102,68 @@ def _fetch_news_eastmoney(code: str, page_size: int = 20) -> list[dict]:
         ),
     }
 
-    resp = _em_get(url, params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
-    text = resp.text
-    text = text[text.index("(") + 1 : text.rindex(")")]
-    data = _json.loads(text)
-
     articles: list[dict] = []
-    for item in data.get("result", {}).get("cmsArticleWebOld", []):
-        articles.append({
-            "title": item.get("title", ""),
-            "content": item.get("content", ""),
-            "time": item.get("date", ""),
-            "source": item.get("mediaName", "东方财富"),
-            "url": item.get("url", ""),
-        })
+    seen_urls: set[str] = set()
+    for page_index in range(1, max_pages + 1):
+        inner_param = {
+            "uid": "",
+            "keyword": code,
+            "type": ["cmsArticleWebOld"],
+            "client": "web",
+            "clientType": "web",
+            "clientVersion": "curr",
+            "param": {
+                "cmsArticleWebOld": {
+                    "searchScope": "default",
+                    "sort": "default",
+                    "pageIndex": page_index,
+                    "pageSize": page_size,
+                    "preTag": "",
+                    "postTag": "",
+                }
+            },
+        }
+        params = {
+            "cb": "callback",
+            "param": _json.dumps(inner_param, ensure_ascii=False),
+            "_": "1",
+        }
+
+        resp = _em_get(url, params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        text = resp.text
+        text = text[text.index("(") + 1 : text.rindex(")")]
+        data = _json.loads(text)
+
+        items = data.get("result", {}).get("cmsArticleWebOld", [])
+        if not items:
+            break
+        added = 0
+        for item in items:
+            u = item.get("url", "")
+            if u in seen_urls:
+                continue
+            seen_urls.add(u)
+            articles.append({
+                "title": item.get("title", ""),
+                "content": item.get("content", ""),
+                "time": item.get("date", ""),
+                "source": item.get("mediaName", "东方财富"),
+                "url": u,
+            })
+            added += 1
+        if added == 0:
+            break
     return articles
 
 
-def _fetch_news_sina(code: str, page_size: int = 20) -> list[dict]:
-    """Sina Finance stock news API (backup source)."""
+def _fetch_news_sina(code: str, page_size: int = 20, max_pages: int = 3) -> list[dict]:
+    """Sina Finance stock news API (backup source).
+
+    分页翻取（Page=N，每页约40条）以覆盖历史日期窗口；新浪响应偏慢，
+    单页失败跳过不中断。
+    """
     prefix = _get_prefix(code)
-    url = (
-        f"https://vip.stock.finance.sina.com.cn/corp/view/"
-        f"vCB_AllNewsStock.php?symbol={prefix}{code}&Page=1"
-    )
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -1154,25 +1172,45 @@ def _fetch_news_sina(code: str, page_size: int = 20) -> list[dict]:
         "Referer": "https://finance.sina.com.cn/",
     }
 
-    resp = _requests.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    resp.encoding = "gb2312"
-    html = resp.text
-
     articles: list[dict] = []
-    rows = _re.findall(
-        r"(\d{4}-\d{2}-\d{2})\s*(?:&nbsp;)*(\d{2}:\d{2})\s*(?:&nbsp;)*"
-        r"<a[^>]+href='([^']+)'[^>]*>([^<]+)</a>",
-        html,
-    )
-    for date_str, time_str, link, title in rows[:page_size]:
-        articles.append({
-            "title": title.strip(),
-            "content": "",
-            "time": f"{date_str} {time_str}",
-            "source": "新浪财经",
-            "url": link,
-        })
+    seen_urls: set[str] = set()
+    for page in range(1, max_pages + 1):
+        try:
+            url = (
+                f"https://vip.stock.finance.sina.com.cn/corp/view/"
+                f"vCB_AllNewsStock.php?symbol={prefix}{code}&Page={page}"
+            )
+            resp = _requests.get(url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            resp.encoding = "gb2312"
+            html = resp.text
+        except Exception:
+            continue  # 新浪偶发超时，跳过该页
+
+        rows = _re.findall(
+            r"(\d{4}-\d{2}-\d{2})\s*(?:&nbsp;)*(\d{2}:\d{2})\s*(?:&nbsp;)*"
+            r"<a[^>]+href='([^']+)'[^>]*>([^<]+)</a>",
+            html,
+        )
+        if not rows:
+            break
+        added = 0
+        for date_str, time_str, link, title in rows:
+            if link in seen_urls:
+                continue
+            seen_urls.add(link)
+            articles.append({
+                "title": title.strip(),
+                "content": "",
+                "time": f"{date_str} {time_str}",
+                "source": "新浪财经",
+                "url": link,
+            })
+            added += 1
+        if added == 0:
+            break
+        if len(articles) >= page_size * 2:
+            break
     return articles
 
 
