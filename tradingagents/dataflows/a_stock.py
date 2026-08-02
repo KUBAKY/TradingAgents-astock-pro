@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Annotated
 from datetime import datetime
+import io
 from dateutil.relativedelta import relativedelta
 import json as _json
 import os
@@ -359,15 +360,23 @@ def _ths_eps_forecast(code: str) -> pd.DataFrame:
     """Fetch consensus EPS forecast from 同花顺 (direct HTTP).
 
     Returns DataFrame with columns roughly: 年度, 预测机构数, 最小值, 均值, 最大值.
+    Returns an empty DataFrame on any failure (never raises, keeps logs clean).
     """
     url = f"https://basic.10jqka.com.cn/new/{code}/worth.html"
     headers = {
         "User-Agent": _UA,
         "Referer": "https://basic.10jqka.com.cn/",
     }
-    r = _requests.get(url, headers=headers, timeout=15)
-    r.encoding = "gbk"
-    dfs = pd.read_html(r.text)
+    try:
+        r = _requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        r.encoding = "gbk"
+        # pandas>=2.1 treats a str as a file path; wrap in StringIO to parse HTML
+        dfs = pd.read_html(io.StringIO(r.text))
+    except Exception as e:
+        logger.warning("THS EPS forecast fetch failed for %s: %s", code, e)
+        return pd.DataFrame()
     # Find the table containing EPS data
     for df in dfs:
         cols = [str(c) for c in df.columns]
@@ -1250,13 +1259,37 @@ def get_global_news(
 
     all_news: list[dict] = []
 
-    # Source 1: CLS wire (财联社快讯) — direct HTTP
+    # Source 1: CLS wire (财联社快讯) — direct HTTP with sign (v1/roll/get_roll_list)
     try:
-        cls_url = "https://www.cls.cn/nodeapi/telegraphList"
-        cls_params = {"rn": str(limit), "page": "1"}
+        import hashlib
+        from urllib.parse import urlencode as _urlencode
+
+        cls_url = "https://www.cls.cn/v1/roll/get_roll_list"
+        cls_params = {
+            "app": "CailianpressWeb",
+            "category": "",
+            "last_time": str(int(time.time())),
+            "os": "web",
+            "refresh_type": "1",
+            "rn": str(limit),
+            "sv": "8.4.6",
+        }
+        # sign = md5(sha1(urlencode(sorted params))); keys are already sorted above
+        cls_params["sign"] = hashlib.md5(
+            hashlib.sha1(
+                _urlencode(cls_params).encode("utf-8")
+            ).hexdigest().encode("utf-8")
+        ).hexdigest()
         cls_headers = {"User-Agent": _UA, "Referer": "https://www.cls.cn/"}
         r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10)
-        d_cls = r_cls.json()
+        d_cls = {}
+        if r_cls.status_code == 200:
+            try:
+                d_cls = r_cls.json()
+            except Exception:
+                d_cls = {}
+        if d_cls.get("errno") != 0:
+            d_cls = {}
         for item in d_cls.get("data", {}).get("roll_data", []):
             title = item.get("title", "") or item.get("brief", "")
             content = item.get("content", "") or item.get("brief", "")

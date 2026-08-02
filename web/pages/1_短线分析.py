@@ -19,6 +19,7 @@ load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 from tradingagents.shortterm import pipeline, screener  # noqa: E402
 from tradingagents.shortterm.history import (  # noqa: E402
+    aggregate_stats,
     evaluate_call,
     list_records,
     load_record,
@@ -253,6 +254,53 @@ with tab_hist:
     else:
         from datetime import datetime as _dt
 
+        st.subheader("📊 复盘胜率")
+        with st.spinner("聚合全部已评分决策…"):
+            stats = aggregate_stats(records)
+        if stats["scored"]:
+            m = st.columns(6)
+            m[0].metric("已评分决策", stats["scored"])
+            m[1].metric("对", stats["wins"], delta_color="off")
+            m[2].metric("错", stats["losses"], delta_color="off")
+            m[3].metric("胜率", f"{stats['win_rate']:.1f}%")
+            m[4].metric("平均 T+3", f"{stats['avg_t3_close']}%")
+            m[5].metric("平均 T+10", f"{stats['avg_t10_close']}%" if stats["avg_t10_close"] is not None else "—")
+            d1, d2 = st.columns(2)
+            d1.metric("买入胜率", f"{stats['by_direction']['买入']['win_rate']:.1f}%"
+                      if stats["by_direction"]["买入"]["count"] else "—",
+                      help=f"买入 {stats['by_direction']['买入']['wins']}胜/"
+                           f"{stats['by_direction']['买入']['losses']}负 · "
+                           f"平均T+3 {stats['by_direction']['买入']['avg_t3']}%")
+            d2.metric("卖出胜率", f"{stats['by_direction']['卖出']['win_rate']:.1f}%"
+                      if stats["by_direction"]["卖出"]["count"] else "—",
+                      help=f"卖出 {stats['by_direction']['卖出']['wins']}胜/"
+                           f"{stats['by_direction']['卖出']['losses']}负 · "
+                           f"平均T+3 {stats['by_direction']['卖出']['avg_t3']}%")
+            if stats["best"] or stats["worst"]:
+                b, w = st.columns(2)
+                if stats["best"]:
+                    b.caption(f"🏆 最优: {stats['best']['name']}({stats['best']['ticker']}) "
+                              f"{stats['best']['trade_date']} {stats['best']['direction']} "
+                              f"T+3 {stats['best']['t3']:+.2f}%")
+                if stats["worst"]:
+                    w.caption(f"📉 最差: {stats['worst']['name']}({stats['worst']['ticker']}) "
+                              f"{stats['worst']['trade_date']} {stats['worst']['direction']} "
+                              f"T+3 {stats['worst']['t3']:+.2f}%")
+            if stats["recent"]:
+                st.markdown("**最近判定**")
+                st.dataframe(
+                    [{"日期": x["trade_date"], "标的": f"{x['name']}({x['ticker']})",
+                      "方向": x["direction"], "T+3": f"{x['t3']:+.2f}%", "判定": x["verdict"]}
+                     for x in stats["recent"]],
+                    use_container_width=True, hide_index=True,
+                )
+            if stats["pending"]:
+                st.caption(f"另 {stats['pending']} 条待验证/不评分（观望、回避或K线不足）")
+        else:
+            st.caption("暂无已评分决策（需方向=买入/卖出且后续 ≥3 根K线）")
+
+        st.subheader("记录明细")
+
         def _label(r):
             t = _dt.fromtimestamp(r["ts"]).strftime("%m-%d %H:%M")
             if r["kind"] == "screen":
@@ -288,6 +336,18 @@ with tab_hist:
                 cols[5].metric("判定", verdict)
                 if ev.get("verdict_basis"):
                     st.caption(f"判定依据: {ev['verdict_basis']}（后续K线 {ev.get('bars_after')} 根）")
+                if ev.get("hit_first"):
+                    h = st.columns(4)
+                    h[0].metric("先触发", ev["hit_first"], delta=f"T+{ev.get('hit_bar')}")
+                    h[1].metric("触发收益", f"{ev.get('hit_pct')}%" if ev.get("hit_pct") is not None else "—")
+                    h[2].metric("止损位", f"{ev.get('stop_px')}" if ev.get("stop_px") is not None else "—")
+                    h[3].metric("目标位", f"{ev.get('target_px')}" if ev.get("target_px") is not None else "—")
+                elif ev.get("raw_stop") or ev.get("raw_target"):
+                    h = st.columns(4)
+                    h[0].metric("止损位", f"{ev.get('stop_px')}" if ev.get("stop_px") is not None else "—")
+                    h[1].metric("目标位", f"{ev.get('target_px')}" if ev.get("target_px") is not None else "—")
+                    h[2].metric("先触发", "未触达")
+                    h[3].metric("触发收益", "—")
             st.markdown(rec.get("report", ""))
             with st.expander("Ch0 扫描原始数据"):
                 st.json(rec["ch0"])
