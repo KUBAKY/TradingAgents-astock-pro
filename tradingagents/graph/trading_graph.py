@@ -292,6 +292,12 @@ class TradingAgentsGraph:
             if effort:
                 kwargs["effort"] = effort
 
+        # 超时治理：deep 节点（研究经理/投资经理）长推理易超默认 60s 请求超时。
+        # 默认放宽到 300s（可用 LLM_TIMEOUT 覆盖）；max_retries=1 避免长生成
+        # 失败后重试放大成本。setdefault 尊重用户在 Web 侧栏的显式配置。
+        kwargs.setdefault("timeout", float(os.environ.get("LLM_TIMEOUT", "300")))
+        kwargs.setdefault("max_retries", 1)
+
         return kwargs
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
