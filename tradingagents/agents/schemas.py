@@ -39,6 +39,23 @@ class PortfolioRating(str, Enum):
     SELL = "Sell"
 
 
+# 评级中英映射：渲染层做 A 股中文适配（"增持 (Overweight)" 双格式）。
+# 兼容性：parse_rating 第 4 通道（中文评级词表）命中行首中文值，
+# 第 3 通道（英文裸词）兜底，两条路径都回到同一 canonical rating。
+RATING_CN = {
+    "Buy": "买入",
+    "Overweight": "增持",
+    "Hold": "持有",
+    "Underweight": "减持",
+    "Sell": "卖出",
+}
+
+
+def _dual_rating(value: str) -> str:
+    """评级双格式 '增持 (Overweight)'：中文展示，parse_rating 中英文通道均可识别。"""
+    return f"{RATING_CN.get(value, value)} ({value})"
+
+
 class TraderAction(str, Enum):
     """3-tier transaction direction used by the Trader.
 
@@ -91,13 +108,16 @@ class ResearchPlan(BaseModel):
 
 
 def render_research_plan(plan: ResearchPlan) -> str:
-    """Render a ResearchPlan to markdown for storage and the trader's prompt context."""
+    """Render a ResearchPlan to markdown for storage and the trader's prompt context.
+
+    中文标题 + 双格式评级（见 ``_dual_rating``），下游 parse_rating 不受影响。
+    """
     return "\n".join([
-        f"**Recommendation**: {plan.recommendation.value}",
+        f"**评级**: {_dual_rating(plan.recommendation.value)}",
         "",
-        f"**Rationale**: {plan.rationale}",
+        f"**理由**: {plan.rationale}",
         "",
-        f"**Strategic Actions**: {plan.strategic_actions}",
+        f"**行动要点**: {plan.strategic_actions}",
     ])
 
 
@@ -135,14 +155,13 @@ class TraderProposal(BaseModel):
 def render_trader_proposal(proposal: TraderProposal) -> str:
     """Render a TraderProposal to markdown.
 
-    The trailing ``FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**`` line is
-    preserved for backward compatibility with the analyst stop-signal text
-    and any external code that greps for it.
+    中文标题 + 双格式操作方向；末尾 ``FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**``
+    行保持英文原样——它是分析师停止信号的文本契约，任何外部代码 grep 它。
     """
     return "\n".join([
-        f"**Action**: {proposal.action.value}",
+        f"**操作**: {_dual_rating(proposal.action.value)}",
         "",
-        f"**Reasoning**: {proposal.reasoning}",
+        f"**理由**: {proposal.reasoning}",
         "",
         f"FINAL TRANSACTION PROPOSAL: **{proposal.action.value.upper()}**",
     ])
@@ -192,20 +211,19 @@ class PortfolioDecision(BaseModel):
 
 
 def render_pm_decision(decision: PortfolioDecision) -> str:
-    """Render a PortfolioDecision back to the markdown shape the rest of the system expects.
+    """Render a PortfolioDecision back to markdown for the rest of the system.
 
-    Memory log, CLI display, and saved report files all read this markdown,
-    so the rendered output preserves the exact section headers (``**Rating**``,
-    ``**Executive Summary**``, ``**Investment Thesis**``) that downstream
-    parsers and the report writers already handle.
+    中文标题 + 双格式评级（``**评级**: 增持 (Overweight)``，见 ``_dual_rating``）：
+    UI/报告中文可读，parse_rating 经中文评级词（第 4 通道）或英文裸词
+    （第 3 通道）均可提取 canonical rating，memory log / CLI / 信号处理不受影响。
     """
     parts = [
-        f"**Rating**: {decision.rating.value}",
+        f"**评级**: {_dual_rating(decision.rating.value)}",
         "",
-        f"**Executive Summary**: {decision.executive_summary}",
+        f"**摘要**: {decision.executive_summary}",
         "",
-        f"**Investment Thesis**: {decision.investment_thesis}",
+        f"**投资论点**: {decision.investment_thesis}",
     ]
     if decision.time_horizon:
-        parts.extend(["", f"**Time Horizon**: {decision.time_horizon}"])
+        parts.extend(["", f"**期限**: {decision.time_horizon}"])
     return "\n".join(parts)

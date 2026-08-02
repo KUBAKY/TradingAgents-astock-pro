@@ -33,8 +33,8 @@ class TestRenderTraderProposal:
     def test_minimal_required_fields(self):
         p = TraderProposal(action=TraderAction.HOLD, reasoning="Balanced setup; no edge.")
         md = render_trader_proposal(p)
-        assert "**Action**: Hold" in md
-        assert "**Reasoning**: Balanced setup; no edge." in md
+        assert "**操作**: 持有 (Hold)" in md
+        assert "**理由**: Balanced setup; no edge." in md
         # The trailing FINAL TRANSACTION PROPOSAL line is preserved for the
         # analyst stop-signal text and any external code that greps for it.
         assert "FINAL TRANSACTION PROPOSAL: **HOLD**" in md
@@ -57,9 +57,9 @@ class TestRenderResearchPlan:
             strategic_actions="Build position over two weeks; cap at 5%.",
         )
         md = render_research_plan(p)
-        assert "**Recommendation**: Overweight" in md
-        assert "**Rationale**: Bull case carried" in md
-        assert "**Strategic Actions**: Build position" in md
+        assert "**评级**: 增持 (Overweight)" in md
+        assert "**理由**: Bull case carried" in md
+        assert "**行动要点**: Build position" in md
 
     def test_all_5_tier_ratings_render(self):
         for rating in PortfolioRating:
@@ -69,7 +69,7 @@ class TestRenderResearchPlan:
                 strategic_actions="s",
             )
             md = render_research_plan(p)
-            assert f"**Recommendation**: {rating.value}" in md
+            assert f"**评级**: " in md and f"({rating.value})" in md
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +139,8 @@ class TestTraderAgent:
         trader = create_trader(llm)
         result = trader(_make_trader_state())
         plan = result["trader_investment_plan"]
-        assert "**Action**: Buy" in plan
-        assert "**Reasoning**: AI capex cycle intact" in plan
+        assert "**操作**: 买入 (Buy)" in plan
+        assert "**理由**: AI capex cycle intact" in plan
         assert "FINAL TRANSACTION PROPOSAL: **BUY**" in plan
         # The same rendered markdown is also added to messages for downstream agents.
         assert plan in result["messages"][0].content
@@ -215,9 +215,9 @@ class TestResearchManagerAgent:
         rm = create_research_manager(llm)
         result = rm(_make_rm_state())
         ip = result["investment_plan"]
-        assert "**Recommendation**: Overweight" in ip
-        assert "**Rationale**: Bull case" in ip
-        assert "**Strategic Actions**: Build position" in ip
+        assert "**评级**: 增持 (Overweight)" in ip
+        assert "**理由**: Bull case" in ip
+        assert "**行动要点**: Build position" in ip
 
     def test_prompt_uses_5_tier_rating_scale(self):
         """The RM prompt must list all five tiers so the schema enum matches user expectations."""

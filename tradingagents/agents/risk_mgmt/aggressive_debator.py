@@ -1,5 +1,8 @@
 
 
+from tradingagents.agents.utils.agent_utils import get_language_instruction
+
+
 def create_aggressive_debator(llm):
     def aggressive_node(state) -> dict:
         risk_debate_state = state["risk_debate_state"]
@@ -44,11 +47,11 @@ Hot Money / Capital Flow Report: {hot_money_report}
 Lockup Expiry / Insider Reduction Report: {lockup_report}
 Conversation history: {history} Last conservative argument: {current_conservative_response} Last neutral argument: {current_neutral_response}. If no responses yet, present your own argument.
 
-Engage actively, debate persuasively, and assert why aggressive positioning is optimal for this A-share opportunity. Output conversationally without special formatting."""
+Engage actively, debate persuasively, and assert why aggressive positioning is optimal for this A-share opportunity. Output conversationally without special formatting.{get_language_instruction()}"""
 
         response = llm.invoke(prompt)
 
-        argument = f"Aggressive Analyst: {response.content}"
+        argument = f"激进分析师: {response.content}"
 
         new_risk_debate_state = {
             "history": history + "\n" + argument,
