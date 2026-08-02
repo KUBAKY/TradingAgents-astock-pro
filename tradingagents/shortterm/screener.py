@@ -186,21 +186,35 @@ def scan(capital: float | None = None, per_board: int = 8,
     return result
 
 
-SCREENER_PROMPT = """你是A股短线选股顾问。以下是程序化三级扫描后的候选池（三排序键合并快照→活跃度粗排→黑名单/异动精扫）。用户资金 {capital} 元。
+SCREENER_PROMPT = """你是A股短线选股顾问（v2：打分横评版）。以下是程序化三级扫描后的候选池（三排序键合并快照→活跃度粗排→黑名单/异动精扫）。用户资金 {capital} 元。
 
-候选池字段说明：main_net_inflow_yi=当日主力净流入(亿元)，main_net_inflow_pct=主力净占比(%)，industry=行业板块，concepts=概念题材标签（均为扫描时点实时快照）。
+候选池字段说明：main_net_inflow_yi=当日主力净流入(亿元)，main_net_inflow_pct=主力净占比(%)，industry=行业板块，concepts=概念题材标签，ch0.anomalies=异动信号列表，ch0.overheated=过热标记，ch0.mode=模式提示(超短/波段)，ch0.ret_7d_pct/ret_30d_pct=近7/30日涨幅，ch0.limit_up_streak=连板数，ch0.lhb_10d=近10日龙虎榜次数，ch0.data_gaps=数据缺口（均为扫描时点实时快照）。
 
-任务：沪深主板、创业板、科创板各选出不超过3只"活跃且值得操作"的标的，给出：
-1. **为什么选它**（结合异动信号/行业题材/主力资金/量能，不用泛泛而谈）
-2. **操作模式**（隔日超短 / 3-10日波段）与**介入方式**（追/等回踩/等竞价确认）
-3. **资金分配**：总资金如何在选中标的间分配（单票仓位上限：超短15%，波段30%）
-4. **误杀复核**：下方 rejected 列表是程序化剔除的票及原因，复核是否有误杀；有误杀说明理由并重新纳入，无误杀简述剔除逻辑成立
+任务分四步：
+
+1. **逐票打分（0-100）**：每只候选票按以下权重打分并列出依据：
+   - 异动质量（30分）：异动信号强弱、是否热点主升而非滞涨脉冲；连板票看封板质量与连板高度
+   - 资金确认（25分）：主力净流入占比、龙虎榜资金性质；大幅净流出却上涨的票最多给一半分
+   - 量价位置（25分）：放量突破/缩量回踩的位置分高；高位放巨量滞涨分低
+   - 题材强度（20分）：概念是市场主线（有板块共振）还是孤立事件
+   给出每票的分数、评级（S/A/B/C）与一句话理由。
+
+2. **跨板块横评排序**：把全部候选（不限板块）按分数排出 TOP3 操作优先级，给出理由与互相比较（为什么 A 排在 B 前面，不能只复述单票理由）。
+
+3. **明日操作计划**：对 TOP3 每只给出：
+   - **介入方式**：追（仅未过热且分歧转一致）/ 等回踩（overheated=true 只能此选项）/ 等竞价确认（给出具体竞价条件，如高开幅度、竞价量能）
+   - **确认失败则放弃的条件**（如低开超X%、竞价量骤缩）
+   - **止损位**（具体价格或百分比）与**止盈目标**（预期空间与理由）
+   - **仓位**：按分数分配；超短单票上限15%，波段单票上限30%，总仓位上限80%，其余留现金
+
+4. **误杀复核**：下方 rejected 列表是程序化剔除的票及原因，复核是否有误杀；有误杀说明理由并重新纳入，无误杀简述剔除逻辑成立。
 
 纪律：
 - 标注 overheated=true 的票只能建议"等回踩"，不能建议追
 - 主力大幅净流出(main_net_inflow_yi 显著为负)且上涨的票，警惕出货，降一档处理
-- 数据缺失(data_gaps非空)的票降一档处理
-- 没有合适标的的板块允许空仓，宁可缺不可滥
+- 数据缺失(data_gaps非空)的票降一档处理；lhb_10d=0 且无主力净流入的纯情绪票降一档
+- C级及以下票不进入操作计划；没有合适标的允许空仓，宁可缺不可滥
+- 所有价格建议用具体数字，禁止模糊表述（如"高开3%以上"→"高开3%+且竞价量≥昨日10%"）
 
 候选池 JSON：
 {candidates}
@@ -234,6 +248,8 @@ def main():
     p.add_argument("--model", default="claude-haiku-4-5")
     p.add_argument("--base-url", default=None)
     p.add_argument("--no-llm", action="store_true", help="只输出扫描JSON，不调LLM")
+    p.add_argument("--save-record", action="store_true",
+                   help="结果落盘到 ~/.tradingagents/shortterm/（与 Web 一致，供复盘）")
     p.add_argument("--out", default=None)
     args = p.parse_args()
 
@@ -245,6 +261,10 @@ def main():
         text = recommend(result, args.provider, args.model, args.base_url)
 
     print(text)
+    if args.save_record:
+        from tradingagents.shortterm.history import save_screen_record
+        path = save_screen_record(result, None if args.no_llm else text)
+        print(f"\n[saved] {path}")
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(text)
