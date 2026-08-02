@@ -74,6 +74,12 @@ class ConditionalLogic:
             state["investment_debate_state"]["count"] >= 2 * self.max_debate_rounds
         ):  # 3 rounds of back-and-forth between 2 agents
             return "Research Manager"
+        # 路由依据 latest_speaker 字段（语言无关）；无前缀解析，
+        # current_response 的中文前缀（多方/空方分析师）不参与路由
+        speaker = state["investment_debate_state"].get("latest_speaker", "")
+        if speaker:
+            return "Bear Researcher" if speaker == "Bull" else "Bull Researcher"
+        # 兼容旧状态（无 latest_speaker 字段的存档/断点）
         if state["investment_debate_state"]["current_response"].startswith("Bull"):
             return "Bear Researcher"
         return "Bull Researcher"

@@ -1,4 +1,6 @@
 
+from tradingagents.agents.utils.agent_utils import get_language_instruction
+
 
 def create_bull_researcher(llm):
     def bull_node(state) -> dict:
@@ -46,18 +48,18 @@ Last bear argument: {current_response}
 
 ⚠️ If the data quality assessment flags any report as low-confidence (grade C/D/F), reduce your reliance on that report and note the data limitation in your argument.
 
-Deliver a compelling bull argument that integrates A-share market dynamics. Refute the bear's concerns and demonstrate why the bull position holds stronger merit in the Chinese market context.
-"""
+Deliver a compelling bull argument that integrates A-share market dynamics. Refute the bear's concerns and demonstrate why the bull position holds stronger merit in the Chinese market context.{get_language_instruction()}"""
 
         response = llm.invoke(prompt)
 
-        argument = f"Bull Analyst: {response.content}"
+        argument = f"多方分析师: {response.content}"
 
         new_investment_debate_state = {
             "history": history + "\n" + argument,
             "bull_history": bull_history + "\n" + argument,
             "bear_history": investment_debate_state.get("bear_history", ""),
             "current_response": argument,
+            "latest_speaker": "Bull",
             "count": investment_debate_state["count"] + 1,
         }
 
