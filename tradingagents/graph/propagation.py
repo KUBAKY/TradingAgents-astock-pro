@@ -57,17 +57,25 @@ class Propagator:
             "lockup_report": "",
         }
 
-    def get_graph_args(self, callbacks: Optional[List] = None) -> Dict[str, Any]:
+    def get_graph_args(
+        self,
+        callbacks: Optional[List] = None,
+        stream_mode: str = "values",
+    ) -> Dict[str, Any]:
         """Get arguments for the graph invocation.
 
         Args:
             callbacks: Optional list of callback handlers for tool execution tracking.
                        Note: LLM callbacks are handled separately via LLM constructor.
+            stream_mode: "values" yields the full state each step (default, used by
+                       CLI/debug paths); "updates" yields only the keys written by
+                       the node that just ran (used by web runner for precise
+                       stage detection + final state via graph.get_state).
         """
         config = {"recursion_limit": self.max_recur_limit}
         if callbacks:
             config["callbacks"] = callbacks
         return {
-            "stream_mode": "values",
+            "stream_mode": stream_mode,
             "config": config,
         }

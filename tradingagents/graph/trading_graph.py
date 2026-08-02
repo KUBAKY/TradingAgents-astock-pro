@@ -496,11 +496,18 @@ class TradingAgentsGraph:
         args = self.propagator.get_graph_args(callbacks=callbacks)
 
         # Inject thread_id so same ticker+date resumes, different date starts fresh.
-        if checkpoint_enabled:
-            tid = thread_id(company_name, str(trade_date))
-            args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = tid
+        # 始终注入（即使未启用 SqliteSaver）：web runner 在 stream_mode="updates"
+        # 下依赖 get_state(config) 取终态，须有 thread_id + 内存 checkpointer。
+        args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = thread_id(
+            company_name, str(trade_date)
+        )
 
-        if checkpoint_enabled and resume_step is not None:
+        if not checkpoint_enabled:
+            # 内存 checkpointer：让 get_state 能取到 thread 终态；
+            # 进程退出即弃，断点续跑仍走上面的 SqliteSaver 分支。
+            from langgraph.checkpoint.memory import MemorySaver
+            self.graph = self.workflow.compile(checkpointer=MemorySaver())
+        elif resume_step is not None:
             return None, args, resume_step
 
         # Initialize state only for fresh runs. Passing a new initial state to

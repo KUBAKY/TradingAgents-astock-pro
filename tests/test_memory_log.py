@@ -791,6 +791,9 @@ class TestLegacyRemoval:
         mock_graph._checkpointer_ctx = None
         mock_graph.config = {"results_dir": str(tmp_path)}
         mock_graph.graph.invoke.return_value = fake_state
+        # prepare_graph_run 在未启用 SqliteSaver 时用 MemorySaver 重新 compile
+        # 图（stream_mode="updates" 需 get_state 取终态）；让编译返回已配置的 mock。
+        mock_graph.workflow.compile.return_value = mock_graph.graph
         mock_graph.propagator.create_initial_state.return_value = fake_state
         mock_graph.propagator.get_graph_args.return_value = {}
         mock_graph.signal_processor.process_signal.return_value = "Buy"

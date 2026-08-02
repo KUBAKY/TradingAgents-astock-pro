@@ -19,6 +19,24 @@ _ANALYST_REPORT_KEYS = [
     "fundamentals_report", "policy_report", "hot_money_report", "lockup_report",
 ]
 
+# stream_mode="updates" 下 chunk 形如 {node_name: {state_key: value}}；
+# 据此把图节点名映射到进度阶段，阶段完成判定按节点写入的 state key。
+_NODE_STAGE_MAP = {}
+for _rk in _ANALYST_REPORT_KEYS:
+    _analyst = _rk.replace("_report", "")
+    _NODE_STAGE_MAP[f"{_analyst.capitalize()} Analyst"] = (_REPORT_KEY_TO_STAGE[_rk], _rk)
+    _NODE_STAGE_MAP[f"tools_{_analyst}"] = (_REPORT_KEY_TO_STAGE[_rk], _rk)
+    _NODE_STAGE_MAP[f"Msg Clear {_analyst.capitalize()}"] = (_REPORT_KEY_TO_STAGE[_rk], _rk)
+_NODE_STAGE_MAP["Quality Gate"] = ("quality_gate", "data_quality_summary")
+_NODE_STAGE_MAP["Bull Researcher"] = ("debate", "investment_debate_state")
+_NODE_STAGE_MAP["Bear Researcher"] = ("debate", "investment_debate_state")
+_NODE_STAGE_MAP["Research Manager"] = ("debate", "investment_plan")
+_NODE_STAGE_MAP["Trader"] = ("trader", "trader_investment_plan")
+_NODE_STAGE_MAP["Aggressive Analyst"] = ("risk", "risk_debate_state")
+_NODE_STAGE_MAP["Neutral Analyst"] = ("risk", "risk_debate_state")
+_NODE_STAGE_MAP["Conservative Analyst"] = ("risk", "risk_debate_state")
+_NODE_STAGE_MAP["Portfolio Manager"] = ("pm", "final_trade_decision")
+
 
 def _discard_stopped_run(
     ticker: str,
@@ -43,39 +61,31 @@ def _detect_completed_stages(
     chunk: dict[str, Any],
     tracker: ProgressTracker,
 ) -> None:
-    """Check the streamed chunk for newly completed stages."""
-    for report_key in _ANALYST_REPORT_KEYS:
-        stage_id = _REPORT_KEY_TO_STAGE[report_key]
-        content = chunk.get(report_key, "")
-        if content and tracker.stage_status(stage_id) != "done":
-            report = normalize_stock_mentions(str(content), tracker.ticker, chunk)
+    """Check the streamed chunk for newly completed stages.
+
+    chunk 形如 {node_name: {state_key: value}}（stream_mode="updates"）。
+    阶段判定只看该节点实际写入的 key，避免 values 模式下整份 state
+    造成的"辩论轮次提前判完成"与阶段跳变。
+    """
+    if not isinstance(chunk, dict):
+        return
+    for node_name, updates in chunk.items():
+        if not isinstance(updates, dict):
+            continue
+        spec = _NODE_STAGE_MAP.get(node_name)
+        if not spec:
+            continue
+        stage_id, key = spec
+        if tracker.stage_status(stage_id) == "done":
+            continue
+        content = updates.get(key)
+        if stage_id == "debate" and key == "investment_debate_state":
+            content = content.get("judge_decision", "") if isinstance(content, dict) else ""
+        elif stage_id == "risk" and key == "risk_debate_state":
+            content = content.get("judge_decision", "") if isinstance(content, dict) else ""
+        if content:
+            report = normalize_stock_mentions(str(content), tracker.ticker, updates)
             tracker.mark_stage_done(stage_id, _strip_think_tags(report))
-
-    dqs = chunk.get("data_quality_summary", "")
-    if dqs and tracker.stage_status("quality_gate") != "done":
-        tracker.mark_stage_done("quality_gate", normalize_stock_mentions(str(dqs), tracker.ticker, chunk))
-
-    debate = chunk.get("investment_debate_state")
-    if debate and isinstance(debate, dict):
-        judge = debate.get("judge_decision", "")
-        if judge and tracker.stage_status("debate") != "done":
-            tracker.mark_stage_done("debate", normalize_stock_mentions(str(judge), tracker.ticker, chunk))
-
-    trader_plan = chunk.get("trader_investment_plan", "")
-    if trader_plan and tracker.stage_status("trader") != "done":
-        report = normalize_stock_mentions(str(trader_plan), tracker.ticker, chunk)
-        tracker.mark_stage_done("trader", _strip_think_tags(report))
-
-    risk = chunk.get("risk_debate_state")
-    if risk and isinstance(risk, dict):
-        risk_judge = risk.get("judge_decision", "")
-        if risk_judge and tracker.stage_status("risk") != "done":
-            tracker.mark_stage_done("risk", normalize_stock_mentions(str(risk_judge), tracker.ticker, chunk))
-
-    final = chunk.get("final_trade_decision", "")
-    if final and tracker.stage_status("pm") != "done":
-        report = normalize_stock_mentions(str(final), tracker.ticker, chunk)
-        tracker.mark_stage_done("pm", _strip_think_tags(report))
 
 
 def _infer_active_stage(tracker: ProgressTracker) -> None:
@@ -105,6 +115,7 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
         trade_date,
         callbacks=[stats],
     )
+    args["stream_mode"] = "updates"
 
     last_chunk: dict[str, Any] = {}
 
@@ -152,10 +163,16 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
         if not last_chunk:
             raise RuntimeError("分析没有返回任何结果，请清理断点后重试。")
 
-        # #55: 报告标的统一显示为「代码+名称」，须在 finalize 落盘前归一化 last_chunk
-        normalize_report_state_mentions(last_chunk, ticker)
+        # updates 模式下每个 chunk 只是节点增量，终态须从 checkpointer 取。
+        snapshot = graph.graph.get_state(args["config"])
+        final_chunk = snapshot.values if snapshot and snapshot.values else None
+        if not final_chunk:
+            raise RuntimeError("分析未生成最终状态，请清理断点后重试。")
 
-        signal = graph.finalize_graph_run(ticker, trade_date, last_chunk)
+        # #55: 报告标的统一显示为「代码+名称」，须在 finalize 落盘前归一化 final_chunk
+        normalize_report_state_mentions(final_chunk, ticker)
+
+        signal = graph.finalize_graph_run(ticker, trade_date, final_chunk)
         if tracker.stop_requested:
             _close_and_discard()
             return
