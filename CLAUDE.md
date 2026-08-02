@@ -33,6 +33,13 @@
 - `web/` — Streamlit Web UI
 - `cli/` — CLI 入口
 
+### 短线交易分析系统（第二产品线，2026-08 起）
+- `tradingagents/shortterm/` — 短线决策闭环：ch0 异动精扫、pipeline 决策、screener 全市场扫描、history 落盘+事后评估、prompts（决策卡/自校准注入）
+- `web/pages/1_短线分析.py` + `web/runner.py` — 短线 UI 与 `stream_mode="updates"` 事件式进度
+- `scripts/close_scan.py`（launchd 盘后自动扫描入口）、`scripts/check_auction.py`（集合竞价验证）
+- 决策落盘目录 `~/.tradingagents/shortterm/`（个人数据，不入库）；调度日志 `~/.tradingagents/logs/`
+- 治理与进度：`docs/GOVERNANCE.md`、`DEV_LOG.md`（短线系统建设期节）
+
 ### 中文股票名解析链路
 用户/LLM 输入 → `safe_ticker_component` 检测中文 → `resolve_ticker()` → `_build_name_code_map()`（mootdx 全市场映射，缓存）→ 返回 6 位代码
 

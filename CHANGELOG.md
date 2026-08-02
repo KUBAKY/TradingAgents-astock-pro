@@ -6,6 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [Unreleased]
+
+### 新增：短线交易分析系统（个人用，2026-08-01 批次）
+
+多 Agent 深度投研主线之外的第二条产品线：A 股短线决策闭环。
+
+- **`tradingagents/shortterm/`**：ch0 异动精扫（黑名单/过热/断板炸板/末7日K线形态）、
+  pipeline 决策流程与决策卡、历史决策落盘（`~/.tradingagents/shortterm/`）
+- **全市场活跃股扫描器**：三排序键合并快照 → 活跃度粗排 → 精扫 → 板块分池 + rejected 复核；
+  并发精扫 + LHB 整榜批量 + mootdx 熔断，消除扫描挂死
+- **短线 Web UI**（Streamlit multipage）：后台线程任务、LLM Key 管理组件 + 节点-模型映射
+  可视化、LLM 配置跨会话持久化
+- **复盘闭环 v1/v2**：事后评估引擎（T+1/T+3/T+10 方向、止损/目标价命中判定）、历史复盘 tab、
+  胜率仪表盘；v2 自校准注入——agent 参考自己历史判断的事后验证
+- **集合竞价采集**：`get_auction_data()`（东财 push2 分笔成交，09:15-09:25 竞价段全量），
+  ch0 窗口门控注入（仅当日 09:15-09:30 生效），`scripts/check_auction.py` 验证脚本
+- **历史新闻翻取**：东财 search-api 翻页 + 新浪翻页兜底（gb2312 解析），覆盖任意历史日期窗口
+- **盘后自动扫描**：`scripts/close_scan.py` launchd 入口（个人环境 15:10 定时，plist 不入库）
+- **选股 v2**：打分横评（异动/资金/量价/题材 + SABC）→ 跨板块 TOP3 → 明日操作计划
+  （介入/放弃条件/止损止盈/仓位）→ 误杀复核；候选池注入历史 T+3 质量反馈（防前视）
+
+### 改动
+
+- **Web 进度事件化**：`web/runner.py` 切 `stream_mode="updates"`，按节点实际写入的 state key
+  精确判定 12 阶段完成（修复 values 模式下辩论多轮写入导致阶段提前完成）；
+  thread_id 始终注入，未启用 SqliteSaver 时用 MemorySaver compile，流末 `graph.get_state`
+  取终态再 finalize（CLI 路径保持 values 模式不变）
+- **LLM 超时治理**：默认请求超时放宽到 300s（`LLM_TIMEOUT` 可覆盖）+ `max_retries=1`，
+  避免 deep 节点长推理超时与失败重试放大成本；`setdefault` 尊重显式配置
+- **i18n 补齐**：风控辩论 + 多空辩手中文化、辩论路由字段化解耦、决策渲染 A 股中文适配
+- **同股多日对比视图**：Web 主分析页按 ticker 聚合历史记录对比
+- **日志卫生**：EPS 一致预期 `pd.read_html` 改 `io.StringIO`（修复 st.log 持续膨胀根因）、
+  财联社签名端点适配
+
+### 修复
+
+- EPS 一致预期解析（read_html 传 bytes 崩溃）
+- 短线页面任务中断（改后台线程）
+- `.DS_Store` 误入库（已移除并 gitignore）
+- `insider` 接口类型防御
+
+### 测试
+
+- 短线系统全套单测（pipeline/ch0/screener/history/decision_render 等）
+- 基线：314 passed / 2 failed（上游 claude CLI 未登录所致，非回归）/ 45 subtests / 1 skipped
+
 ## [0.4.0] — 2026-07-31
 
 新增：让节点走**个人 Claude Pro/Max 订阅额度**而非按 token 计费的 Anthropic API。

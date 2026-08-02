@@ -460,6 +460,42 @@ pyproject.toml:
 
 ---
 
+## 短线系统建设期(2026-08-01)
+
+**目标:个人用 A 股短线交易分析闭环** — 全市场扫描 → 单票精扫 → 决策落盘 → 事后评估 → 自校准 → 盘后自动扫描 → 集合竞价参考。与主线（7 Analyst 深度投研）并行，复用同一数据层与 LLM 基建。
+
+### 阶段进度（均已完成，对应 commit 从 `205b17a` 起共 25 个）
+
+- **P1 短线分析模块**：`tradingagents.shortterm` 独立包 — ch0 异动精扫（黑名单/过热/断板炸板/7日K线形态）、pipeline 决策流程、决策卡
+- **P2 全市场扫描器**：`scripts/screener.py` — 三排序键合并快照（涨停/涨幅/量比）→ 活跃度粗排 → 黑名单/异动精扫 → 板块分池 + rejected 复核
+- **P3 短线 Web UI**：Streamlit multipage `web/pages/1_短线分析.py` — 后台线程任务（切页不中断）、LLM Key 管理组件 + 节点-模型映射可视化、LLM 配置跨会话持久化（.env）
+- **P4 复盘闭环 v1/v2**：决策落盘（`~/.tradingagents/shortterm/`）+ 事后评估引擎（T+1/T+3/T+10 方向、止损/目标价命中判定）+ 历史复盘 tab + 胜率仪表盘；v2 自校准注入（agent 看到自己历史判断的事后验证，防前视）
+- **P5 性能与稳定性**：并发精扫 + LHB 整榜批量 + mootdx 熔断（消除扫描挂死）+ bundle 预览/意图 chips/jobs 上限/零 churn 轮询
+- **P6 i18n 补齐**：风控辩论 + 多空辩手中文化、辩论路由字段化解耦、决策渲染 A 股中文适配
+- **P7 数据修复批**：EPS 一致预期 read_html→StringIO（st.log 238MB 根因）、财联社签名端点、日志卫生
+- **① 盘后自动扫描 launchd**：`scripts/close_scan.py` + `~/Library/LaunchAgents/com.tradingagents.close-scan.plist`（Weekday 1-5 15:10，stdout/stderr→`~/.tradingagents/logs/close-scan.log`）；修复 provider 分支覆盖 `--no-llm` 的 bug
+- **② 集合竞价采集**：`a_stock.get_auction_data()`（东财 push2 分笔成交 details/get，单请求全天分笔含 09:15-09:25 竞价段；push2ex rc=102 失效、push2his SSL 不稳定已弃用）+ `ch0._collect_auction` 窗口门控（仅当日 09:15-09:30）+ `scripts/check_auction.py` 验证脚本
+- **③ 历史新闻翻取**：东财 search-api 翻页 + 新浪翻页兜底（gb2312 解析），覆盖任意历史日期窗口（东财搜索接口临时风控时新浪为实际工作源）
+- **④ runner 事件式阶段指示**：`web/runner.py` 切 `stream_mode="updates"`，按 `{node: {key: value}}` 精确判定 12 阶段完成（修复 values 模式辩论轮次误判）；thread_id 始终注入，未启用 SqliteSaver 时 MemorySaver compile，流末 `graph.get_state` 取终态
+- **⑤ LLM 超时治理**：deep 节点长推理超 ChatOpenAI 默认 60s → 默认 `timeout=300`（`LLM_TIMEOUT` 可覆盖）+ `max_retries=1`（setdefault 尊重显式配置）
+- **⑥ 选股 v2**：打分横评（异动30/资金25/量价25/题材20 + SABC 评级）→ 跨板块 TOP3 → 明日操作计划（介入/放弃条件/止损止盈/仓位）→ 误杀复核；候选池逐票注入历史 T+3 质量反馈（防前视，行复制零变异）
+
+### 踩坑记录（本期）
+
+- 东财 `push2ex.getStockFenShi` 返回 rc=102；`push2his trends2` 带 beticks 但 SSL 持续 `DECRYPTION_FAILED_OR_BAD_RECORD_MAC` → 竞价主源锁定 `push2.eastmoney.com/api/qt/stock/details/get`（`pos=0&pageSize=5000` 单请求全量）
+- 东财 search-api 新闻接口会临时返回 0 条（关键词级风控/空），必须留新浪兜底
+- 竞价 tick 格式 `time,price,vol,...`，09:25:00 末笔=匹配价；`details/get` 周末返回最近交易日，trade_date 仅作缓存键，防旧数据靠 ch0 窗口门控
+- runner 阶段判定旧实现用 values 整份 state → 辩论多轮写入同 key 导致阶段提前完成；updates 模式只看节点实际写入的 key 才准确
+- 结构化输出：DeepSeek V4/reasoner 拒绝 LangChain function-spec 的 `tool_choice`，须显式置 None（llm_clients 既有约定，本期沿用）
+
+### 未开始 / 待窗口
+
+- ⏳ **mootdx 熔断实测（⑩）**：熔断代码已就位（`27368e0`），等真实交易日验证
+- ⏳ 集合竞价 + 盘后自动扫描首个交易日实测（周一 09:15-09:30 / 15:10）
+- ⏳ 发布到 GitHub + EP16 视频（长期搁置项）
+
+---
+
 ## 视频内容映射(EP12 - EP16)
 
 | 集数 | 主题 | 对应里程碑 |
@@ -473,7 +509,10 @@ pyproject.toml:
 
 ---
 
-## 当前进展(2026-05-12)
+## 当前进展快照(2026-05-12，历史)
+
+> 下方为 2026-05-12 时的进度快照，已属历史。此后进展见上方
+> 「短线系统建设期(2026-08-01)」及 CHANGELOG。
 
 ### 已完成
 
