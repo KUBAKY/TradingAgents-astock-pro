@@ -43,6 +43,7 @@ def gather_data_bundle(ticker: str, trade_date: str, mode: str) -> str:
     add("资金流向", lambda: a_stock.get_fund_flow(ticker, trade_date, True))
     add("龙虎榜", lambda: a_stock.get_dragon_tiger_board(ticker, trade_date, 30))
     add("概念板块归属", lambda: a_stock.get_concept_blocks(ticker))
+    add("基本面快查", lambda: a_stock.get_fundamentals(ticker, trade_date))
     add("个股新闻", lambda: a_stock.get_news(ticker, start, trade_date))
 
     if mode == "swing":
@@ -140,6 +141,14 @@ def _run_impl(ticker: str, trade_date: str, intent: str, capital: float | None,
         hist = ""
     if hist:
         ch0_block += "\n\n" + hist
+    # v2.1 误差反馈：该票近期验证结论 + 方向级错判警示（注册表数据，无则零变化）
+    try:
+        from tradingagents.analysis_registry.feedback import feedback_injection_block
+        fbk = feedback_injection_block(ch0["ticker"])
+    except Exception:
+        fbk = ""
+    if fbk:
+        ch0_block += "\n\n" + fbk
 
     extras = []
     if intent:

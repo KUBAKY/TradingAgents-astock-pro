@@ -31,6 +31,15 @@ def _dummy_api_keys(monkeypatch):
         monkeypatch.setenv(env_var, os.environ.get(env_var, "placeholder"))
 
 
+@pytest.fixture(autouse=True)
+def _isolated_registry_dir(tmp_path, monkeypatch):
+    """注册表索引 + 回填数据源隔离到 tmp：测试触发 register/backfill 不污染真实数据。"""
+    monkeypatch.setenv("TRADINGAGENTS_REGISTRY_DIR", str(tmp_path / "registry"))
+    monkeypatch.setenv("TRADINGAGENTS_SHORTTERM_DIR", str(tmp_path / "shortterm"))
+    monkeypatch.setenv("TRADINGAGENTS_LOGS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("TRADINGAGENTS_DEEPREVIEW_DIR", str(tmp_path / "deepreview"))
+
+
 @pytest.fixture()
 def mock_llm_client():
     client = MagicMock()

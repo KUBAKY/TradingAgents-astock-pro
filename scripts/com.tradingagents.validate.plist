@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradingagents.validate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/liyaweimacbook/projects/TradingAgents-astock/.venv/bin/python</string>
+        <string>/Users/liyaweimacbook/projects/TradingAgents-astock/scripts/run_validations.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/liyaweimacbook/projects/TradingAgents-astock</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <array>
+            <integer>1</integer>
+            <integer>2</integer>
+            <integer>3</integer>
+            <integer>4</integer>
+            <integer>5</integer>
+        </array>
+        <key>Hour</key>
+        <integer>15</integer>
+        <key>Minute</key>
+        <integer>35</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/liyaweimacbook/.tradingagents/logs/validate.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/liyaweimacbook/.tradingagents/logs/validate.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>zh_CN.UTF-8</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

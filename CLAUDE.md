@@ -39,6 +39,13 @@
 - `web/pages/2_持仓管理.py` — 持仓 CRUD + 每日跟进 + 快照盈亏仪表盘
 - `scripts/close_scan.py`（launchd 盘后自动扫描入口）、`scripts/close_portfolio.py`（launchd 盘后自动持仓跟进）、`scripts/check_auction.py`（集合竞价验证）
 - 决策落盘目录 `~/.tradingagents/shortterm/`（个人数据，不入库）；调度日志 `~/.tradingagents/logs/`
+
+### 统一分析结果注册表（2026-08 起，⑪）
+- `tradingagents/analysis_registry/` — 六类分析结果统一索引与闭环（KINDS=stock/follow/screen/pick/deep_review/mainline）：`registry.py`（record_id=`<kind>:<ticker>:<trade_date>:<ts>` 幂等注册 + 首次 backfill，4 个注册点 wrapper 已接：短线 pipeline/screener/portfolio、deep_review）、`compare.py`（after_register 同票最近两条自动规则对比 → `compare/*.json`；LLM 深度对比仅手动+成本记账）、`validate.py`（盘后自动验证：stock/follow=3 交易日其余=10，幂等三态，rating→方向映射，K 线补齐基准收盘副本不回写，单条降级不抛）、`feedback.py`（误差报告 `reports/feedback_<asof>.md` + 同方向错判≥50% 纪律注入短线 pipeline v2.1，失败空串零干扰）
+- 目录 `~/.tradingagents/analysis_registry/`（`TRADINGAGENTS_REGISTRY_DIR` 覆盖；源目录 `TRADINGAGENTS_SHORTTERM_DIR`/`_LOGS_DIR`/`_DEEPREVIEW_DIR` 供测试隔离）
+- `scripts/run_validations.py`（launchd 工作日 15:35 已装 com.tradingagents.validate）、`scripts/run_feedback.py`
+- `web/pages/3_分析对比.py` — 同票跨方式时间线（含验证列）/规则对比/手动 LLM 对比/手动补验证/误差报告；`web/pages/1_短线分析.py` 复盘 tab 有 page_link 入口
+- 测试：`tests/test_analysis_registry.py`(21)/`test_compare.py`(17)/`test_validate.py`(21)/`test_feedback.py`(10)；conftest autouse 四目录 tmp 隔离
 - 治理与进度：`docs/GOVERNANCE.md`、`DEV_LOG.md`（短线系统建设期节）
 
 ### 中文股票名解析链路
