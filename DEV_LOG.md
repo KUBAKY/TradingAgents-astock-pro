@@ -464,7 +464,7 @@ pyproject.toml:
 
 **目标:个人用 A 股短线交易分析闭环** — 全市场扫描 → 单票精扫 → 决策落盘 → 事后评估 → 自校准 → 盘后自动扫描 → 集合竞价参考。与主线（7 Analyst 深度投研）并行，复用同一数据层与 LLM 基建。
 
-### 阶段进度（均已完成，对应 commit 从 `205b17a` 起共 25 个）
+### 阶段进度（P1~P6 + ①~⑥ 对应 commit 从 `205b17a` 起共 25 个；⑦⑧ 待 commit）
 
 - **P1 短线分析模块**：`tradingagents.shortterm` 独立包 — ch0 异动精扫（黑名单/过热/断板炸板/7日K线形态）、pipeline 决策流程、决策卡
 - **P2 全市场扫描器**：`scripts/screener.py` — 三排序键合并快照（涨停/涨幅/量比）→ 活跃度粗排 → 黑名单/异动精扫 → 板块分池 + rejected 复核
@@ -479,6 +479,8 @@ pyproject.toml:
 - **④ runner 事件式阶段指示**：`web/runner.py` 切 `stream_mode="updates"`，按 `{node: {key: value}}` 精确判定 12 阶段完成（修复 values 模式辩论轮次误判）；thread_id 始终注入，未启用 SqliteSaver 时 MemorySaver compile，流末 `graph.get_state` 取终态
 - **⑤ LLM 超时治理**：deep 节点长推理超 ChatOpenAI 默认 60s → 默认 `timeout=300`（`LLM_TIMEOUT` 可覆盖）+ `max_retries=1`（setdefault 尊重显式配置）
 - **⑥ 选股 v2**：打分横评（异动30/资金25/量价25/题材20 + SABC 评级）→ 跨板块 TOP3 → 明日操作计划（介入/放弃条件/止损止盈/仓位）→ 误杀复核；候选池逐票注入历史 T+3 质量反馈（防前视，行复制零变异）
+- **⑦ 持仓管理**：`tradingagents/shortterm/portfolio.py` — 持仓 CRUD（state.json 原子写，损坏自动恢复空表）+ 每日快照（snapshots/<date>.json，mootdx→sina 兜底）+ `run_daily_follow` 逐票完整决策（割/持/补方向解析、单票失败不阻塞、当日幂等跳过、`--force` 重跑）+ 模块级 `pipeline_run` 惰性导入（便于测试 monkeypatch）+ `web/pages/2_持仓管理.py`（列表 data_editor 增删改 / 添加 / 后台 job 跟进 / 历史快照盈亏）+ `scripts/close_portfolio.py` + launchd plist（Weekday 1-5 15:15，紧接 close-scan 15:10）+ 实网端到端验证（占位持仓 000725/600519，方向解析 + 成本记账 + 快照 pnl_pct 全通）
+- **⑧ AI 成本核算**：`tradingagents/cost/` — pricing（DeepSeek 官方中文定价页自动刷新，>7 天 stale 每进程一次，失败静默回退）+ ledger（jsonl 账本，聚合不提前 round）+ tracker（contextvar 按 feature 分类：main_graph/shortterm/screener/portfolio）；`pipeline.build_llm` 出口 wrap_llm、`_RequestsAnthropicLLM` 补 usage 透传、`pipeline.run` try/finally 防线程污染 + `result["cost"]`、screener.recommend 接入；UI `web/components/cost_panel.py`（今日/本周/本月 + 分组 + 价格状态 + 手动刷新）；`scripts/refresh_deepseek_pricing.py` 手动刷新（含 --json 供 cron）；定价与账本目录 `TRADINGAGENTS_COST_DIR` 可覆盖；**deepseek 运行默认模型全链路切 `deepseek-v4-flash`**（0.02/1/2 元每百万 tokens，pipeline/portfolio/close 脚本/web 页默认）
 
 ### 踩坑记录（本期）
 
@@ -487,6 +489,12 @@ pyproject.toml:
 - 竞价 tick 格式 `time,price,vol,...`，09:25:00 末笔=匹配价；`details/get` 周末返回最近交易日，trade_date 仅作缓存键，防旧数据靠 ch0 窗口门控
 - runner 阶段判定旧实现用 values 整份 state → 辩论多轮写入同 key 导致阶段提前完成；updates 模式只看节点实际写入的 key 才准确
 - 结构化输出：DeepSeek V4/reasoner 拒绝 LangChain function-spec 的 `tool_choice`，须显式置 None（llm_clients 既有约定，本期沿用）
+- DeepSeek 官方定价页响应 Content-Type 无 charset → `requests` 误判 ISO-8859-1 中文全乱 → `pricing._http_get` 用 `r.content.decode(r.apparent_encoding or "utf-8")`
+- 快照 `pnl_pct` 口径两连坑：(1) 存储即百分比数值（25.0=25%），UI 消费端又乘 100 → 放大百倍，统一存储口径后消费端只格式化；(2) 顶层 `pnl_pct`/`total_cost` 漏写，只有逐票行有 → 补顶层字段 + 测试断言
+- `take_snapshot` 循环里漏 `rows.append(row)` → 总市值对但 positions 空（被测试抓到）；`list_snapshots` 用 `stem.isdigit()` 漏 `2026-08-03` 格式日期 → 改正则
+- 名称映射（mootdx 全市场）查询失败会阻塞 `add_position` → try/except 包住，失败留空名绝不阻断添加
+- 测试陷阱：`run_daily_follow` 的 `_import_pipeline` 惰性导入使 monkeypatch 时序隐蔽（patch 后 import 才生效）；autouse fixture 同时禁 `_lookup_name` + `run_ch0` 后全测 0.5s 跑完（此前 30~108s 实网）
+- 端到端实测：mootdx K 线对 000725 熔断 300s → sina HTTP fallback 正常出价（5.42），快照/决策不受影响；LLM 两次跑方向不同（卖出→观望）证明真实调用非缓存
 
 ### 未开始 / 待窗口
 
