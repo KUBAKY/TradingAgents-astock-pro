@@ -26,19 +26,19 @@ from tradingagents.shortterm.history import (  # noqa: E402
     save_screen_record,
     save_stock_record,
 )
+from web.components.cost_panel import render_cost_panel, render_run_cost  # noqa: E402
+from web.components.decision_card import render_decision_header  # noqa: E402
+from web.components.trace_viewer import render_trace_viewer  # noqa: E402
 from web.shortterm_jobs import clear_job, get_job, latest_job_id, start_job  # noqa: E402
+from web.ui_theme import apply_theme  # noqa: E402
 
 st.set_page_config(page_title="短线分析", page_icon="⚡", layout="wide")
 
-st.markdown("""<style>
-.stApp { background: #0a0a0a; }
-button[kind="primary"] {
-    background: linear-gradient(135deg, #ff5a1f, #ff8c42) !important;
-    border: none !important; font-weight: 700 !important;
-}
-</style>""", unsafe_allow_html=True)
+apply_theme()
 
 st.title("⚡ A股短线分析")
+st.caption("个股决策：单票 Ch0 扫描 + LLM 决策卡 · 全市场选股：三板块精扫推荐 · "
+           "历史复盘：胜率仪表盘 · 执行轨迹：Prompt/原始返回排查")
 
 _ENV_KEYS = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -54,7 +54,7 @@ from web.llm_keys import get_pref, render_api_key_input, set_pref  # noqa: E402
 
 _PROVIDERS_ST = ["anthropic", "deepseek", "minimax", "qwen", "glm", "openai_compatible"]
 _DEFAULT_MODELS = {
-    "anthropic": "claude-haiku-4-5", "deepseek": "deepseek-chat",
+    "anthropic": "claude-haiku-4-5", "deepseek": "deepseek-v4-flash",
     "minimax": "MiniMax-M2.7", "qwen": "qwen-plus", "glm": "glm-4",
     "openai_compatible": "",
 }
@@ -101,7 +101,11 @@ with st.sidebar:
     if provider == "anthropic":
         st.caption("anthropic 走 requests 直连（绕开 headroom-proxy 的 httpx 502）")
 
-tab_stock, tab_screen, tab_hist = st.tabs(["个股决策", "全市场选股", "历史复盘"])
+    st.markdown("---")
+    render_cost_panel()
+
+tab_stock, tab_screen, tab_hist, tab_trace = st.tabs(
+    ["个股决策", "全市场选股", "历史复盘", "执行轨迹"])
 
 
 def show_result(result: dict):
@@ -118,6 +122,8 @@ def show_result(result: dict):
     cols[4].metric("模式", ch0["mode_hint"]["label"])
     if ch0.get("anomalies"):
         st.warning(" | ".join(a["signal"] for a in ch0["anomalies"]))
+    render_decision_header(result["report"], result.get("validation"))
+    render_run_cost(result.get("cost"))
     st.markdown(result["report"])
     with st.expander("Ch0 扫描原始数据"):
         st.json(ch0)
@@ -154,6 +160,8 @@ with tab_stock:
     shares = c6.number_input("持仓股数", min_value=0, value=0, step=100) or None
 
     ch0_only = st.checkbox("只跑 Ch0 扫描（不调 LLM，免费）", value=False)
+    trace_on = st.checkbox("记录执行轨迹（Prompt 全文+原始返回，排查用）",
+                           value=False)
 
     if st.button("开始分析", type="primary", key="stock_run"):
         if not ticker.strip():
@@ -163,6 +171,7 @@ with tab_stock:
                 res = pipeline.run(
                     ticker.strip(), trade_date, intent, capital, cost, shares,
                     provider, model or "claude-haiku-4-5", base_url, ch0_only,
+                    trace=trace_on,
                 )
                 save_stock_record(res, {"intent": intent, "capital": capital,
                                         "cost": cost, "shares": shares})
@@ -215,11 +224,42 @@ with tab_screen:
         st.session_state["screen_job"] = job_id
         st.session_state.pop("sc_result", None)
 
+    def _render_scan_cards(scan_result: dict):
+        """候选池卡片化：分板块表格，原始 JSON 收 expander。"""
+        board_names = {"main": "沪深主板", "cyb": "创业板", "kcb": "科创板"}
+        for board, candidates in (scan_result.get("boards") or {}).items():
+            if not candidates:
+                continue
+            st.markdown(f"**{board_names.get(board, board)} · {len(candidates)} 只候选**")
+            rows = []
+            for c in candidates:
+                ch0 = c.get("ch0") or {}
+                rows.append({
+                    "代码": c.get("code"),
+                    "名称": c.get("name"),
+                    "现价": c.get("price"),
+                    "涨幅%": c.get("chg_pct"),
+                    "活跃度": c.get("activity_score"),
+                    "7日%": ch0.get("ret_7d_pct"),
+                    "连板": ch0.get("limit_up_streak") or 0,
+                    "龙虎榜10日": ch0.get("lhb_10d") or 0,
+                    "触发信号": "；".join(ch0.get("anomalies") or []) or "—",
+                    "概念": (c.get("concepts") or "")[:30],
+                })
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        rejected = scan_result.get("rejected") or {}
+        if rejected:
+            with st.expander(f"已淘汰 {sum(len(v) for v in rejected.values())} 只（原因明细）"):
+                st.json(rejected)
+
     def _render_screen_result(sc):
         if sc[0] == "json":
-            st.json(sc[1])
+            _render_scan_cards(sc[1])
+            with st.expander("扫描原始 JSON"):
+                st.json(sc[1])
         else:
             st.markdown(sc[1])
+            _render_scan_cards(sc[2])
             with st.expander("候选池原始数据"):
                 st.json(sc[2])
             st.download_button("下载推荐 (md)", sc[1], file_name="screener.md")
@@ -294,6 +334,23 @@ with tab_hist:
                      for x in stats["recent"]],
                     use_container_width=True, hide_index=True,
                 )
+            if len(stats.get("scored_all") or []) >= 2:
+                import pandas as pd
+
+                all_scored = stats["scored_all"]  # 旧→新
+                wins_cum, cum_w = [], 0
+                for i, x in enumerate(all_scored, 1):
+                    cum_w += 1 if x["verdict"] == "对" else 0
+                    wins_cum.append({"序号": i, "累计胜率%": round(cum_w / i * 100, 1)})
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**累计胜率走势**")
+                    st.line_chart(pd.DataFrame(wins_cum).set_index("序号"),
+                                  height=220)
+                with c2:
+                    st.markdown("**T+3 收益分布**")
+                    df_t3 = pd.DataFrame({"T+3收益%": [x["t3"] for x in all_scored]})
+                    st.bar_chart(df_t3, height=220)
             if stats["pending"]:
                 st.caption(f"另 {stats['pending']} 条待验证/不评分（观望、回避或K线不足）")
         else:
@@ -348,9 +405,12 @@ with tab_hist:
                     h[1].metric("目标位", f"{ev.get('target_px')}" if ev.get("target_px") is not None else "—")
                     h[2].metric("先触发", "未触达")
                     h[3].metric("触发收益", "—")
+            render_decision_header(rec.get("report", ""), rec.get("validation"))
             st.markdown(rec.get("report", ""))
             with st.expander("Ch0 扫描原始数据"):
                 st.json(rec["ch0"])
             if rec.get("bundle"):
                 with st.expander("数据包原文"):
                     st.text(rec["bundle"])
+with tab_trace:
+    render_trace_viewer()

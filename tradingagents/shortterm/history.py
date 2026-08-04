@@ -20,6 +20,7 @@ _LOCK = threading.Lock()
 
 _DIRECTION_RE = re.compile(r"\*\*方向\*\*[:：]\s*(买入|观望|卖出|回避)")
 _CONFIDENCE_RE = re.compile(r"\*\*置信度\*\*[:：]\s*(高|中|低)")
+_HORIZON_RE = re.compile(r"\*\*适用周期\*\*[:：]\s*(隔日超短|3-10日波段)")
 
 _PX_RE = re.compile(r"([-+]?\d+(?:\.\d+)?)")
 
@@ -57,11 +58,13 @@ def parse_price_levels(report: str) -> dict[str, Any]:
 
 
 def parse_decision(report: str) -> dict[str, str | None]:
-    """从决策卡 markdown 提取方向/置信度（DECISION_CARD_FORMAT 强制格式）。"""
+    """从决策卡 markdown 提取方向/置信度/适用周期（DECISION_CARD_FORMAT 强制格式）。"""
     d = _DIRECTION_RE.search(report or "")
     c = _CONFIDENCE_RE.search(report or "")
+    h = _HORIZON_RE.search(report or "")
     return {"direction": d.group(1) if d else None,
-            "confidence": c.group(1) if c else None}
+            "confidence": c.group(1) if c else None,
+            "horizon": h.group(1) if h else None}
 
 
 def _atomic_write(path: Path, payload: dict) -> None:
@@ -95,6 +98,7 @@ def save_stock_record(result: dict, inputs: dict) -> Path | None:
         "report": report,
         "parsed": parse_decision(report),
         "levels": parse_price_levels(report),
+        "validation": result.get("validation"),
     }
     path = _DIR / f"{ch0['ticker']}_{ch0['trade_date']}_{ts}.json"
     with _LOCK:
@@ -334,7 +338,7 @@ def aggregate_stats(records: list[dict], asof_date: str | None = None) -> dict[s
                          "卖出": {"count": 0, "wins": 0, "losses": 0,
                                  "win_rate": None, "avg_t3": None}},
         "avg_t1_close": None, "avg_t3_close": None, "avg_t10_close": None,
-        "best": None, "worst": None, "recent": [],
+        "best": None, "worst": None, "recent": [], "scored_all": [],
     }
 
     scored: list[dict] = []
@@ -411,6 +415,8 @@ def aggregate_stats(records: list[dict], asof_date: str | None = None) -> dict[s
     if scored:
         stats["best"] = max(scored, key=lambda x: x["t3"])
         stats["worst"] = min(scored, key=lambda x: x["t3"])
+    # scored_all: 旧→新，供胜率曲线等图表；recent: 新→旧前 10 条
+    stats["scored_all"] = sorted(scored, key=lambda x: x["trade_date"])
     scored.sort(key=lambda x: x["trade_date"], reverse=True)
     stats["recent"] = scored[:10]
     return stats

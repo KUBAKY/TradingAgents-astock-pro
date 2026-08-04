@@ -66,15 +66,15 @@ def _mock_ohlcv_hl(monkeypatch, bars):
 class TestParseDecision:
     def test_full(self):
         p = sh.parse_decision(_report("卖出", "中"))
-        assert p == {"direction": "卖出", "confidence": "中"}
+        assert p == {"direction": "卖出", "confidence": "中", "horizon": None}
 
     def test_missing(self):
         p = sh.parse_decision("# 无格式报告")
-        assert p == {"direction": None, "confidence": None}
+        assert p == {"direction": None, "confidence": None, "horizon": None}
 
     def test_colon_variants(self):
         p = sh.parse_decision("**方向**：回避\n**置信度**：低")
-        assert p == {"direction": "回避", "confidence": "低"}
+        assert p == {"direction": "回避", "confidence": "低", "horizon": None}
 
 
 class TestParsePriceLevels:
@@ -409,3 +409,15 @@ class TestAggregateStats:
         s = sh.aggregate_stats(recs)
         assert s["scored"] == 0 and s["pending"] == 4
         assert s["win_rate"] is None and s["best"] is None
+
+
+class TestScoredAll:
+    def test_scored_all_chronological(self, monkeypatch):
+        helper = TestAggregateStats()
+        recs = helper._setup(monkeypatch)
+        s = sh.aggregate_stats(recs)
+        assert len(s["scored_all"]) == s["scored"]
+        dates = [x["trade_date"] for x in s["scored_all"]]
+        assert dates == sorted(dates)  # 旧→新
+        recent_dates = [x["trade_date"] for x in s["recent"]]
+        assert recent_dates == sorted(recent_dates, reverse=True)  # 新→旧
