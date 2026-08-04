@@ -20,6 +20,7 @@ from datetime import datetime
 
 from ..dataflows import a_stock
 from ..dataflows.a_stock import _em_get
+from ..cost import tracker as _cost
 from .ch0 import count_lhb_batch, run_ch0
 from .pipeline import build_llm
 
@@ -247,6 +248,7 @@ def _candidate_history(code: str, before_date: str) -> list[dict]:
 
 def recommend(scan_result: dict, provider: str, model: str,
               base_url: str | None = None) -> str:
+    _cost.cost_context("screener", None)  # 单次推荐，账本记 feature 分组
     trade_date = scan_result["trade_date"]
     slim = {
         "trade_date": trade_date,

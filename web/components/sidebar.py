@@ -11,6 +11,7 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.checkpointer import clear_checkpoint
 from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
 from web.llm_keys import get_pref, key_status, mask_key, render_api_key_input, set_pref
+from web.components.cost_panel import render_cost_panel
 from web.history import (
     clear_incomplete_task,
     get_history,
@@ -425,6 +426,9 @@ def render_sidebar() -> None:
                 st.session_state["comparing_ticker"] = t
                 st.session_state["viewing_history"] = None
                 st.session_state["start_analysis"] = None
+
+    st.markdown("---")
+    render_cost_panel()
 
     st.markdown("---")
     st.caption("⚠️ 仅供学习研究，不构成投资建议")

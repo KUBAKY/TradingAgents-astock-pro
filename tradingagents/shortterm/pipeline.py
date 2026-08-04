@@ -10,11 +10,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import uuid
 from datetime import datetime, timedelta
 
+from . import trace as _trace
+from ..cost import tracker as _cost
+from ..llm_clients.factory import create_llm_client
 from .ch0 import run_ch0
+from .anchors import check_numeric_anchors
+from .assertions import check_assertions
 from .history import load_past_evaluations
 from .prompts import QUICK_PROMPT, SWING_PROMPT, ULTRA_SHORT_PROMPT, ch0_summary_block, history_block
+from .schema import build_retry_feedback, validate_decision_card
 
 
 def gather_data_bundle(ticker: str, trade_date: str, mode: str) -> str:
@@ -57,8 +64,9 @@ class _RequestsAnthropicLLM:
                          or "https://api.anthropic.com").rstrip("/")
 
     class _Resp:
-        def __init__(self, content: str):
+        def __init__(self, content: str, usage: dict | None = None):
             self.content = content
+            self.usage = usage or {}
 
     def invoke(self, prompt: str) -> "_RequestsAnthropicLLM._Resp":
         import requests
@@ -72,27 +80,42 @@ class _RequestsAnthropicLLM:
             timeout=300,
         )
         r.raise_for_status()
-        blocks = r.json().get("content", [])
+        data = r.json()
+        blocks = data.get("content", [])
         text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
         if not text.strip():
             kinds = [b.get("type") for b in blocks]
-            raise RuntimeError(f"LLM 返回空文本 (blocks={kinds}, stop={r.json().get('stop_reason')})")
-        return self._Resp(text)
+            raise RuntimeError(f"LLM 返回空文本 (blocks={kinds}, stop={data.get('stop_reason')})")
+        return self._Resp(text, usage=data.get("usage"))
 
 
 def build_llm(provider: str, model: str, base_url: str | None):
     if provider.lower() == "anthropic":
-        return _RequestsAnthropicLLM(model, base_url)
-    from ..llm_clients.factory import create_llm_client
-
-    client = create_llm_client(provider, model, base_url)
-    return client.get_llm()
+        llm: object = _RequestsAnthropicLLM(model, base_url)
+    else:
+        client = create_llm_client(provider, model, base_url)
+        llm = client.get_llm()
+    return _cost.wrap_llm(llm, provider, model)
 
 
 def run(ticker: str, trade_date: str, intent: str = "", capital: float | None = None,
         cost: float | None = None, shares: int | None = None,
-        provider: str = "deepseek", model: str = "deepseek-chat",
-        base_url: str | None = None, ch0_only: bool = False) -> dict:
+        provider: str = "deepseek", model: str = "deepseek-v4-flash",
+        base_url: str | None = None, ch0_only: bool = False,
+        trace: bool = False, cost_feature: str = "shortterm") -> dict:
+
+    run_id = uuid.uuid4().hex
+    tokens = _cost.cost_context(cost_feature, run_id)
+    try:
+        return _run_impl(ticker, trade_date, intent, capital, cost, shares,
+                         provider, model, base_url, ch0_only, trace, run_id)
+    finally:
+        _cost.reset_cost_context(tokens)  # 线程内不留残留（web job 线程/测试复用安全）
+
+
+def _run_impl(ticker: str, trade_date: str, intent: str, capital: float | None,
+              cost: float | None, shares: int | None, provider: str, model: str,
+              base_url: str | None, ch0_only: bool, trace: bool, run_id: str) -> dict:
 
     ch0 = run_ch0(ticker, trade_date)
 
@@ -139,10 +162,57 @@ def run(ticker: str, trade_date: str, intent: str = "", capital: float | None = 
     prompt = prompt_tpl.replace("{ch0_summary}", ch0_block).replace("{data_bundle}", bundle)
 
     llm = build_llm(provider, model, base_url)
+    t0 = datetime.now()
     resp = llm.invoke(prompt)
     report = resp.content if hasattr(resp, "content") else str(resp)
 
-    return {"ch0": ch0, "mode": mode, "report": report, "bundle": bundle}
+    # 契约校验（格式 schema + 断言红线）：违规 → 带清单反馈重试一次，仍失败标记不阻塞
+    def _violations(text: str) -> list[str]:
+        return validate_decision_card(text, mode) + check_assertions(text)
+
+    violations = _violations(report)
+    first_report, first_violations = report, violations
+    retried = False
+    if violations:
+        retried = True
+        try:
+            resp2 = llm.invoke(prompt + build_retry_feedback(report, violations))
+            report2 = resp2.content if hasattr(resp2, "content") else str(resp2)
+            violations2 = _violations(report2)
+            if not violations2:
+                report, violations = report2, []
+            else:
+                violations = violations2
+        except Exception:
+            pass
+    elapsed_ms = int((datetime.now() - t0).total_seconds() * 1000)
+
+    # 数值锚定（软告警）：报告引用的基本面数字须能在数据源中找到
+    unanchored = check_numeric_anchors(report, f"{ch0_block}\n\n{bundle}")
+
+    validation = {"ok": not violations, "violations": violations,
+                  "retried": retried, "unanchored": unanchored}
+
+    # 执行轨迹（默认关闭，trace=True 或 ST_TRACE=1 开启；落盘失败不阻塞）
+    trace_path = None
+    if _trace.trace_enabled(trace):
+        try:
+            rec = {"ticker": ch0["ticker"], "name": ch0.get("name", ""),
+                   "trade_date": trade_date, "mode": mode,
+                   "provider": provider, "model": model,
+                   "prompt": prompt, "response": report,
+                   "validation": validation, "elapsed_ms": elapsed_ms,
+                   "attempts": 2 if retried else 1}
+            if retried:
+                rec["first_response"] = first_report
+                rec["first_violations"] = first_violations
+            trace_path = str(_trace.save_trace(rec))
+        except Exception:
+            trace_path = None
+
+    return {"ch0": ch0, "mode": mode, "report": report, "bundle": bundle,
+            "validation": validation, "trace_path": trace_path,
+            "cost": _cost.run_summary(run_id)}
 
 
 def main():
@@ -154,14 +224,15 @@ def main():
     p.add_argument("--cost", type=float, default=None, help="持仓成本价（被套分析时传）")
     p.add_argument("--shares", type=int, default=None, help="持仓股数")
     p.add_argument("--provider", default=os.environ.get("ST_PROVIDER", "deepseek"))
-    p.add_argument("--model", default=os.environ.get("ST_MODEL", "deepseek-chat"))
+    p.add_argument("--model", default=os.environ.get("ST_MODEL", "deepseek-v4-flash"))
     p.add_argument("--base-url", default=os.environ.get("ST_BASE_URL"))
     p.add_argument("--ch0-only", action="store_true", help="只跑 Ch0 扫描，不调 LLM")
+    p.add_argument("--trace", action="store_true", help="落盘执行轨迹（Prompt 全文+原始返回）")
     p.add_argument("--out", default=None, help="报告输出路径（markdown）")
     args = p.parse_args()
 
     result = run(args.ticker, args.date, args.intent, args.capital, args.cost, args.shares,
-                 args.provider, args.model, args.base_url, args.ch0_only)
+                 args.provider, args.model, args.base_url, args.ch0_only, trace=args.trace)
 
     print(result["report"])
     if args.out:

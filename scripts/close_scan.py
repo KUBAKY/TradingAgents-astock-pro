@@ -34,12 +34,12 @@ def _pick_provider() -> tuple[str, str]:
             provider = os.environ.get("ST_PROVIDER", "anthropic")
     models = {
         "anthropic": "claude-haiku-4-5",
-        "deepseek": "deepseek-chat",
+        "deepseek": "deepseek-v4-flash",
         "minimax": "minimax-text-01",
         "qwen": "qwen-max",
         "glm": "glm-4-plus",
     }
-    return provider, models.get(provider, "deepseek-chat")
+    return provider, models.get(provider, "deepseek-v4-flash")
 
 
 def main() -> int:
