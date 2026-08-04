@@ -149,8 +149,64 @@ def compute_price_metrics(df: pd.DataFrame) -> dict[str, Any]:
         "is_250d_high": bool(last_close >= prev_250_high * 0.999),
         "is_250d_low": bool(last_close <= prev_250_low * 1.001),
         "recent_bars": compute_recent_bars(df),
+        "patterns": detect_volume_price_patterns(df),
         "bars": len(df),
     }
+
+
+def detect_volume_price_patterns(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """量价形态五信号（《投资分析体系》v1.1 量化阈值）。
+
+    1. volume_breakout 放量突破: 量≥5日均量2倍 且收盘破20日平台高点
+    2. shrink_pullback 缩量回调: 当日下跌 且量<5日均量50%（买入信号）
+    3. price_volume_divergence 量价背离: 价创20日新高 但量≤5日均量（价升量缩）
+    4. volume_stagnation 放量滞涨: |涨幅|<1% 且量≥5日均量2倍（出货嫌疑）
+    5. strong_seal 缩量封死(封单强度近似): 涨幅≥9.5% 且收最高 且量≤5日均量1.5倍
+    """
+    df = df.sort_values("Date").reset_index(drop=True)
+    if len(df) < 21:
+        return []
+    close = df["Close"].astype(float)
+    vol = df["Volume"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+
+    last = df.iloc[-1]
+    prev_close = float(close.iloc[-2])
+    last_close = float(close.iloc[-1])
+    vol_ma5 = float(vol.iloc[-6:-1].mean())
+    if vol_ma5 <= 0 or prev_close <= 0:
+        return []
+    vol_ratio = float(vol.iloc[-1]) / vol_ma5
+    pct_chg = (last_close / prev_close - 1) * 100
+    rng = float(last["High"]) - float(last["Low"])
+    close_pos = (last_close - float(last["Low"])) / rng if rng > 0 else 0.5
+
+    platform_high = float(high.iloc[-21:-1].max())
+    out: list[dict[str, Any]] = []
+    detail = {"vol_ratio_vs_5d": round(vol_ratio, 2), "pct_chg": round(pct_chg, 2)}
+
+    if vol_ratio >= 2.0 and last_close > platform_high:
+        out.append({"type": "volume_breakout",
+                    "signal": f"放量突破：量比 {vol_ratio:.1f}（≥2），收盘 {last_close} 突破20日平台高点 {platform_high}",
+                    "detail": detail})
+    if pct_chg < 0 and vol_ratio <= 0.5:
+        out.append({"type": "shrink_pullback",
+                    "signal": f"缩量回调：当日 {pct_chg:.1f}% 且量仅5日均量 {vol_ratio:.0%}（≤50%），回调健康",
+                    "detail": detail})
+    if last_close > platform_high and vol_ratio <= 1.0:
+        out.append({"type": "price_volume_divergence",
+                    "signal": f"量价背离：价创20日新高但量能萎缩（量比 {vol_ratio:.1f}），上涨缺乏资金确认",
+                    "detail": detail})
+    if abs(pct_chg) < 1.0 and vol_ratio >= 2.0:
+        out.append({"type": "volume_stagnation",
+                    "signal": f"放量滞涨：量比 {vol_ratio:.1f} 但涨幅仅 {pct_chg:.1f}%，出货嫌疑",
+                    "detail": detail})
+    if pct_chg >= 9.5 and close_pos >= 0.95 and vol_ratio <= 1.5:
+        out.append({"type": "strong_seal",
+                    "signal": f"缩量封死：涨停收最高位且量比 {vol_ratio:.1f}（≤1.5），封单强（封单/成交>10 近似）",
+                    "detail": detail})
+    return out
 
 
 def detect_limit_streak(df: pd.DataFrame, limit_pct: float) -> dict[str, int]:
@@ -225,12 +281,72 @@ def scan_anomalies(metrics: dict, board: str, mcap_tier: str,
     if metrics.get("is_250d_low"):
         out.append({"type": "breakdown", "signal": "创250日新低"})
 
+    margin_pct = metrics.get("margin_to_float_mcap_pct")
+    if margin_pct is not None and margin_pct > 15:
+        out.append({"type": "margin_risk",
+                    "signal": f"融资余额占流通市值 {margin_pct}% > 15%，杠杆过高风险线"})
+
     if limit["limit_up_streak"] >= 2:
         out.append({"type": "limit_up", "signal": f"连续涨停 {limit['limit_up_streak']} 天 ({limit_pct}%板)"})
     if limit["limit_down_streak"] >= 2:
         out.append({"type": "limit_down", "signal": f"连续跌停 {limit['limit_down_streak']} 天"})
 
     return out
+
+
+# 散户集中营营业部关键词（东财拉萨系为主；启发式名单，作提示信号不作硬黑名单）
+RETAIL_DEPT_KEYWORDS = ("拉萨", "东环路", "团结路")
+
+
+def _is_retail_seat(name: str) -> bool:
+    """营业部名称是否散户集中营（名称含关键词）。"""
+    return any(k in (name or "") for k in RETAIL_DEPT_KEYWORDS)
+
+
+def detect_retail_takeover(seats: dict | None) -> list[dict]:
+    """龙虎榜散户接盘信号：买方散户净买 > 卖方散户 且 卖方存在非散户席位（游资/机构离场）。
+
+    启发式：提示信号，不作硬黑名单。
+    """
+    if not seats:
+        return []
+    buy = seats.get("buy") or []
+    sell = seats.get("sell") or []
+
+    def _retail_sum(rows):
+        return sum(r.get("amount_yi") or 0 for r in rows
+                   if _is_retail_seat(r.get("name") or ""))
+
+    buy_r, sell_r = _retail_sum(buy), _retail_sum(sell)
+    if buy_r <= 0 or buy_r <= sell_r:
+        return []
+    non_retail_sell = sum(r.get("amount_yi") or 0 for r in sell
+                          if not _is_retail_seat(r.get("name") or ""))
+    if non_retail_sell <= 0:
+        return []
+    return [{
+        "type": "retail_takeover",
+        "signal": (f"龙虎榜散户接盘：买方散户席位净买 {buy_r:.2f}亿 > 卖方散户 "
+                   f"{sell_r:.2f}亿，且非散户席位卖出 {non_retail_sell:.2f}亿"
+                   "（游资/机构离场），警惕次日分歧"),
+        "detail": {"buy_retail_yi": buy_r, "sell_retail_yi": sell_r,
+                   "sell_non_retail_yi": non_retail_sell,
+                   "trade_date": seats.get("trade_date")},
+    }]
+
+
+def _institutional_activity(seats: dict | None) -> dict | None:
+    """龙虎榜机构席位（OPERATEDEPT_CODE="0"）买卖净额。无机构参与返回 None。"""
+    if not seats:
+        return None
+    buy = sum(r.get("amount_yi") or 0 for r in seats.get("buy") or []
+              if str(r.get("code") or "") == "0")
+    sell = sum(r.get("amount_yi") or 0 for r in seats.get("sell") or []
+               if str(r.get("code") or "") == "0")
+    if buy == 0 and sell == 0:
+        return None
+    return {"buy_yi": round(buy, 2), "sell_yi": round(sell, 2),
+            "net_yi": round(buy - sell, 2)}
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +506,31 @@ def run_ch0(ticker: str, trade_date: str,
     if auction is False:
         data_gaps.append("auction")
 
+    try:
+        from ..dataflows.a_stock import get_margin_data
+        md = get_margin_data(code, trade_date)
+    except Exception:
+        md = None
+    if md:
+        float_mcap_yi = float(quote.get("float_mcap_yi") or 0)
+        if float_mcap_yi > 0:
+            metrics["margin_balance_yi"] = md["rz_balance_yi"]
+            metrics["margin_to_float_mcap_pct"] = round(
+                md["rz_balance_yi"] / float_mcap_yi * 100, 1)
+        else:
+            data_gaps.append("margin(流通市值缺失，无法计算杠杆率)")
+    else:
+        data_gaps.append("margin")
+
+    try:
+        from ..dataflows.a_stock import get_lhb_seats
+        seats = get_lhb_seats(code, trade_date)
+    except Exception:
+        seats = None
+    inst_flow = _institutional_activity(seats)
+
     anomalies = scan_anomalies(metrics, board, mcap_tier, turnover, limit)
+    anomalies.extend(detect_retail_takeover(seats))
     mode = decide_mode(anomalies, metrics, max(lhb_10d, 0))
 
     if not anomalies:
@@ -409,6 +549,7 @@ def run_ch0(ticker: str, trade_date: str,
         "anomalies": anomalies,
         "mode_hint": mode,
         "auction": auction or None,
+        "institutional_flow": inst_flow,
         "data_gaps": data_gaps,
     }
 

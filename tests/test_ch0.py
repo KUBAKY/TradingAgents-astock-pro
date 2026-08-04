@@ -271,6 +271,11 @@ class TestRunCh0Injection:
     def _mock_base(self, monkeypatch):
         df = _df([10.0 + i * 0.05 for i in range(60)], start="2026-05-01")
         monkeypatch.setattr(ch0_mod, "_load_ohlcv_astock", lambda c, d: df)
+        monkeypatch.setattr(ch0_mod, "_collect_auction", lambda *a, **k: None)
+        monkeypatch.setattr("tradingagents.dataflows.a_stock.get_margin_data",
+                            lambda *a, **k: None)
+        monkeypatch.setattr("tradingagents.dataflows.a_stock.get_lhb_seats",
+                            lambda *a, **k: None)
 
     def test_injected_quote_skips_tencent(self, monkeypatch):
         self._mock_base(monkeypatch)
@@ -309,3 +314,83 @@ class TestRunCh0Injection:
 
         out = run_ch0("600001", "2026-08-01")
         assert out["lhb_appearances_10d"] == 5
+
+
+def _mk_df(closes, vols, start="2026-01-01", last_open=None, last_high=None,
+           last_low=None):
+    """构造 K 线：前 N-1 根 open=prev close，最后一根可自定义 OHLC（测封板）。"""
+    n = len(closes)
+    dates = pd.date_range(start, periods=n, freq="B")
+    opens = [closes[0]] + list(closes[:-1])
+    highs, lows = [], []
+    for i, c in enumerate(closes):
+        if i == n - 1 and last_high is not None:
+            highs.append(last_high)
+            lows.append(last_low)
+        else:
+            highs.append(c * 1.01)
+            lows.append(c * 0.99)
+    if last_open is not None:
+        opens[-1] = last_open
+    return pd.DataFrame({
+        "Date": dates, "Open": opens, "High": highs, "Low": lows,
+        "Close": closes, "Volume": vols,
+    })
+
+
+class TestVolumePricePatterns:
+    """量价形态五信号（《投资分析体系》v1.1 量化阈值）。"""
+
+    def test_volume_breakout(self):
+        # 前 20 日平台高点 10.0，末日放量突破至 11
+        closes = [10.0] * 24 + [11.0]
+        vols = [5000.0] * 24 + [20000.0]
+        df = _mk_df(closes, vols)
+        pats = ch0_mod.detect_volume_price_patterns(df)
+        assert any(p["type"] == "volume_breakout" for p in pats)
+
+    def test_shrink_pullback(self):
+        # 末日跌 2% 且量 < 5 日均量 50%
+        closes = [10.0] * 24 + [9.8]
+        vols = [5000.0] * 24 + [1500.0]
+        df = _mk_df(closes, vols)
+        pats = ch0_mod.detect_volume_price_patterns(df)
+        assert any(p["type"] == "shrink_pullback" for p in pats)
+
+    def test_price_volume_divergence(self):
+        # 末日创 20 日新高但量能萎缩
+        closes = [10.0] * 24 + [10.2]
+        vols = [5000.0] * 24 + [4000.0]
+        df = _mk_df(closes, vols)
+        pats = ch0_mod.detect_volume_price_patterns(df)
+        assert any(p["type"] == "price_volume_divergence" for p in pats)
+
+    def test_volume_stagnation(self):
+        # 末日巨量但涨幅 <1% → 出货嫌疑
+        closes = [10.0] * 24 + [10.05]
+        vols = [5000.0] * 24 + [20000.0]
+        df = _mk_df(closes, vols)
+        pats = ch0_mod.detect_volume_price_patterns(df)
+        assert any(p["type"] == "volume_stagnation" for p in pats)
+
+    def test_strong_seal_approx(self):
+        # 涨停封死（收最高 close_pos≈1）且缩量 → 封单强近似
+        closes = [10.0] * 24 + [11.0]
+        vols = [5000.0] * 24 + [4500.0]
+        df = _mk_df(closes, vols, last_open=10.0, last_high=11.0, last_low=10.0)
+        pats = ch0_mod.detect_volume_price_patterns(df)
+        assert any(p["type"] == "strong_seal" for p in pats)
+
+    def test_quiet_day_no_patterns(self):
+        closes = [10.0] * 30
+        vols = [5000.0] * 30
+        df = _mk_df(closes, vols)
+        assert ch0_mod.detect_volume_price_patterns(df) == []
+
+    def test_mounted_in_price_metrics(self):
+        closes = [10.0] * 24 + [11.0]
+        vols = [5000.0] * 24 + [20000.0]
+        df = _mk_df(closes, vols)
+        m = compute_price_metrics(df)
+        assert "patterns" in m
+        assert any(p["type"] == "volume_breakout" for p in m["patterns"])

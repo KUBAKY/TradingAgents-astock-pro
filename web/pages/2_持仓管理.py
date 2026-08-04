@@ -38,6 +38,7 @@ _ENV_KEYS = {
     "openai_compatible": "OPENAI_COMPATIBLE_API_KEY",
 }
 
+from web.components.ticker_input import ticker_input  # noqa: E402
 from web.llm_keys import get_pref, render_api_key_input, set_pref  # noqa: E402
 
 _PROVIDERS_ST = ["anthropic", "deepseek", "minimax", "qwen", "glm", "openai_compatible"]
@@ -142,8 +143,8 @@ with tab_list:
 
 
 with tab_add:
-    c1, c2, c3, c4 = st.columns(4)
-    ticker = c1.text_input("股票代码", placeholder="000725")
+    c2, c3, c4 = st.columns(3)
+    ticker = ticker_input("股票代码", key="pf_ticker")
     cost_price = c2.number_input("成本价（元）", min_value=0.0, value=0.0, step=0.01)
     shares = c3.number_input("股数", min_value=1, value=100, step=100)
     buy_date = c4.date_input("买入日期", value=date.today())
@@ -222,10 +223,16 @@ with tab_follow:
                     "代码": r["ticker"], "名称": r.get("name", ""),
                     "方向": d, "置信度": r.get("confidence") or "—",
                     "成本(¥)": f"{r.get('cost_cny') or 0:.4f}",
+                    "深度复核": (f"{r.get('deep_review_signal') or '待复核'}"
+                                 if r.get("deep_review") else "—"),
+                    "复核报告": r.get("deep_review_path") or "",
                     "报告": r.get("report_path") or "",
                     "错误": r.get("error") or "",
                 })
             st.dataframe(pd.DataFrame(rows), hide_index=True)
+            if result.get("deep_reviewed"):
+                st.info(f"{result['deep_reviewed']} 只持仓触发主线深度复核"
+                        "（方向=卖出 或 高危异动：散户接力/融资风险/过热）")
             snap2 = result.get("snapshot") or {}
             if snap2.get("total_value"):
                 a, b, c = st.columns(3)
@@ -266,5 +273,7 @@ with tab_snap:
                 "方向": r.get("direction") or "未解析",
                 "置信度": r.get("confidence") or "—",
                 "成本(¥)": f"{r.get('cost_cny') or 0:.4f}",
+                "深度复核": (f"{r.get('deep_review_signal') or '待复核'}"
+                             if r.get("deep_review") else "—"),
                 "错误": r.get("error") or "",
             } for r in s["results"]]), hide_index=True)

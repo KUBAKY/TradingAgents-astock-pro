@@ -18,6 +18,7 @@ from web.history import (
     get_incomplete_history,
     record_incomplete_task,
 )
+from web.components.ticker_input import ticker_input
 
 # Provider display names in recommended order
 _PROVIDERS: list[tuple[str, str]] = [
@@ -313,11 +314,10 @@ def render_sidebar() -> None:
     st.markdown("---")
     st.markdown("#### 新建分析")
 
-    ticker = st.text_input(
+    ticker = ticker_input(
         "股票代码",
-        placeholder="例: 300750 或 宁德时代",
         key="input_ticker",
-        help="输入6位A股代码或中文股票全称",
+        placeholder="搜索名称或代码，如 宁德时代 / 300750",
     )
 
     trade_date = st.date_input(

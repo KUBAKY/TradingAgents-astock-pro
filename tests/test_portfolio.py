@@ -205,3 +205,116 @@ class TestDailyFollow:
         portfolio.run_daily_follow("2026-08-03")
         assert len(saved) == 1
         assert saved[0][1]["kind"] == "follow"
+
+
+class TestDeepReviewTrigger:
+    """#2 融合：方向=卖出 或 高危异动 → 主线深度复核。"""
+
+    def _dr_run(self, ticker, trade_date, **kw):
+        return {"ok": True, "ticker": ticker, "trade_date": trade_date,
+                "reason": kw.get("reason"), "signal": "Sell",
+                "report": "深度报告", "report_path": f"/tmp/dr_{ticker}.json"}
+
+    def _run_with(self, monkeypatch, report=None, anomalies=None, direction_hint=None):
+        ch0 = {"ticker": "000725", "name": "京东方A", "trade_date": "2026-08-03",
+               "metrics": {"last_close": 5.0}, "anomalies": anomalies or []}
+        report = report or (f"**方向**：{direction_hint}\n\n**置信度**：高"
+                            f"\n\n**适用周期**：3-10日波段" if direction_hint
+                            else "**方向**：买入\n\n**置信度**：高")
+        def fake(ticker, trade_date, **kw):
+            return {"ch0": ch0, "mode": "swing", "report": report,
+                    "bundle": "", "validation": {"ok": True, "violations": [], "retried": False},
+                    "cost": {"calls": 1, "total_cost_cny": 0.1}}
+        monkeypatch.setattr(portfolio, "pipeline_run", fake)
+        monkeypatch.setattr(portfolio, "save_stock_record", lambda r, i: None)
+        portfolio.add_position("000725", 4.0, 100)
+        return portfolio.run_daily_follow("2026-08-03")
+
+    def test_triggered_on_sell(self, fresh, monkeypatch):
+        calls = []
+        monkeypatch.setattr(portfolio, "deep_review_run",
+                            lambda *a, **k: calls.append(k) or self._dr_run(*a, **k))
+        r = self._run_with(monkeypatch, direction_hint="卖出")
+        row = r["results"][0]
+        assert row["deep_review"] is True
+        assert row["deep_review_signal"] == "Sell"
+        assert row["deep_review_path"] == "/tmp/dr_000725.json"
+        assert calls and calls[0]["reason"].startswith("持仓异常复核")
+        assert r["deep_reviewed"] == 1
+
+    def test_triggered_on_high_risk_anomaly(self, fresh, monkeypatch):
+        calls = []
+        monkeypatch.setattr(portfolio, "deep_review_run",
+                            lambda *a, **k: calls.append(1) or self._dr_run(*a, **k))
+        r = self._run_with(monkeypatch, direction_hint="买入",
+                           anomalies=[{"type": "retail_takeover", "signal": "散户接力"}])
+        assert r["results"][0]["deep_review"] is True
+        assert calls
+
+    def test_margin_risk_also_triggers(self, fresh, monkeypatch):
+        calls = []
+        monkeypatch.setattr(portfolio, "deep_review_run",
+                            lambda *a, **k: calls.append(1) or self._dr_run(*a, **k))
+        r = self._run_with(monkeypatch, anomalies=[{"type": "margin_risk", "signal": "融资"}])
+        assert r["results"][0]["deep_review"] is True
+        assert calls
+
+    def test_normal_buy_no_trigger(self, fresh, monkeypatch):
+        calls = []
+        monkeypatch.setattr(portfolio, "deep_review_run",
+                            lambda *a, **k: calls.append(1) or self._dr_run(*a, **k))
+        r = self._run_with(monkeypatch, direction_hint="买入")
+        assert r["results"][0]["deep_review"] is False
+        assert calls == []
+
+    def test_unrelated_anomaly_no_trigger(self, fresh, monkeypatch):
+        calls = []
+        monkeypatch.setattr(portfolio, "deep_review_run",
+                            lambda *a, **k: calls.append(1) or self._dr_run(*a, **k))
+        r = self._run_with(monkeypatch, direction_hint="买入",
+                           anomalies=[{"type": "volume_breakout", "signal": "放量"}])
+        assert r["results"][0]["deep_review"] is False
+        assert calls == []
+
+    def test_capped_at_max_deep_reviews(self, fresh, monkeypatch):
+        calls = []
+        monkeypatch.setattr(portfolio, "deep_review_run",
+                            lambda *a, **k: calls.append(1) or self._dr_run(*a, **k))
+        for t in ("000725", "600519", "300750"):
+            portfolio.add_position(t, 10.0, 100)
+        def fake3(ticker, trade_date, **kw):
+            return {"ch0": {"ticker": ticker, "anomalies":
+                            [{"type": "overheat", "signal": "过热"}]},
+                    "mode": "swing", "bundle": "",
+                    "report": "**方向**：卖出\n\n**置信度**：高\n\n**适用周期**：隔日超短",
+                    "cost": {"calls": 1, "total_cost_cny": 0.1}}
+        monkeypatch.setattr(portfolio, "pipeline_run", fake3)
+        monkeypatch.setattr(portfolio, "save_stock_record", lambda r, i: None)
+        r = portfolio.run_daily_follow("2026-08-03", max_deep_reviews=2)
+        assert sum(1 for row in r["results"] if row["deep_review"]) == 3
+        assert len(calls) == 2  # 上限截断
+
+    def test_failure_recorded(self, fresh, monkeypatch):
+        monkeypatch.setattr(portfolio, "deep_review_run",
+                            lambda *a, **k: {"ok": False, "error": "主线挂了"})
+        r = self._run_with(monkeypatch, direction_hint="卖出")
+        assert r["results"][0]["deep_review"] is True
+        assert r["results"][0]["deep_review_error"] == "主线挂了"
+        assert r["results"][0]["deep_review_signal"] is None
+
+
+class TestNeedsDeepReview:
+    def test_sell_always(self):
+        assert portfolio._needs_deep_review({}, "卖出") is True
+        assert portfolio._needs_deep_review(None, "卖出") is True
+
+    def test_high_risk_types(self):
+        for t in ("retail_takeover", "margin_risk", "overheat"):
+            ch0 = {"anomalies": [{"type": t, "signal": "x"}]}
+            assert portfolio._needs_deep_review(ch0, "买入") is True, t
+
+    def test_normal(self):
+        ch0 = {"anomalies": [{"type": "volume_breakout", "signal": "x"}]}
+        assert portfolio._needs_deep_review(ch0, "买入") is False
+        assert portfolio._needs_deep_review(None, None) is False
+        assert portfolio._needs_deep_review({}, None) is False

@@ -2222,6 +2222,90 @@ def get_dragon_tiger_board(
     return "\n".join(lines)
 
 
+def get_margin_data(ticker: str, trade_date: str | None = None) -> dict | None:
+    """融资融券余额（东财 datacenter RPTA_RZRQ_GGMX 个股明细）。
+
+    Args:
+        ticker: 6-digit A-share code
+        trade_date: YYYY-MM-DD（仅日志用途，接口默认返回最新）
+
+    Returns:
+        {"date", "rz_balance_yi"(融资余额,亿), "rq_balance_yi"(融券余额,亿)}
+        无数据或失败返回 None（调用方记 data_gaps，不抛异常）。
+    """
+    code = safe_ticker_component(ticker)
+    try:
+        rows = _eastmoney_datacenter(
+            "RPTA_RZRQ_GGMX",
+            filter_str=f'(SCODE="{code}")',
+            page_size=1,
+            sort_columns="END_DATE",
+            sort_types="-1",
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "date": str(row.get("END_DATE", ""))[:10],
+            "rz_balance_yi": round((row.get("RZYE") or 0) / 1e8, 2),
+            "rq_balance_yi": round((row.get("RQYE") or 0) / 1e8, 2),
+        }
+    except Exception:
+        return None
+
+
+def get_lhb_seats(ticker: str, trade_date: str) -> dict | None:
+    """最近一次龙虎榜买卖席位（结构化，供席位性质判定）。
+
+    Returns:
+        {"trade_date": str, "buy": [{"name","amount_yi","code"}],
+         "sell": [{"name","amount_yi","code"}]}
+        无上榜记录或失败返回 None。
+    """
+    code = safe_ticker_component(ticker)
+    try:
+        data = _eastmoney_datacenter(
+            "RPT_DAILYBILLBOARD_DETAILSNEW",
+            filter_str=(
+                f"(TRADE_DATE<='{trade_date}')" if trade_date else ""
+            ),
+            page_size=1,
+            sort_columns="TRADE_DATE",
+            sort_types="-1",
+        )
+        if not data:
+            return None
+        latest_date = str(data[0].get("TRADE_DATE", ""))[:10]
+
+        buy_data = _eastmoney_datacenter(
+            "RPT_BILLBOARD_DAILYDETAILSBUY",
+            filter_str=f"(TRADE_DATE='{latest_date}')(SECURITY_CODE=\"{code}\")",
+            page_size=20,
+            sort_columns="BUY",
+            sort_types="-1",
+        )
+        sell_data = _eastmoney_datacenter(
+            "RPT_BILLBOARD_DAILYDETAILSSELL",
+            filter_str=f"(TRADE_DATE='{latest_date}')(SECURITY_CODE=\"{code}\")",
+            page_size=20,
+            sort_columns="SELL",
+            sort_types="-1",
+        )
+        return {
+            "trade_date": latest_date,
+            "buy": [{"name": r.get("OPERATEDEPT_NAME", ""),
+                     "amount_yi": round((r.get("BUY") or 0) / 1e8, 3),
+                     "code": r.get("OPERATEDEPT_CODE")}
+                    for r in (buy_data or [])],
+            "sell": [{"name": r.get("OPERATEDEPT_NAME", ""),
+                      "amount_yi": round((r.get("SELL") or 0) / 1e8, 3),
+                      "code": r.get("OPERATEDEPT_CODE")}
+                     for r in (sell_data or [])],
+        }
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 16. Lockup Expiry Calendar (限售解禁日历)
 # ---------------------------------------------------------------------------

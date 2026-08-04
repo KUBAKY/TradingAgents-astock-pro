@@ -28,6 +28,7 @@ from tradingagents.shortterm.history import (  # noqa: E402
 )
 from web.components.cost_panel import render_cost_panel, render_run_cost  # noqa: E402
 from web.components.decision_card import render_decision_header  # noqa: E402
+from web.components.ticker_input import ticker_input  # noqa: E402
 from web.components.trace_viewer import render_trace_viewer  # noqa: E402
 from web.shortterm_jobs import clear_job, get_job, latest_job_id, start_job  # noqa: E402
 from web.ui_theme import apply_theme  # noqa: E402
@@ -135,8 +136,8 @@ def show_result(result: dict):
 
 
 with tab_stock:
-    c1, c2, c3 = st.columns(3)
-    ticker = c1.text_input("股票代码", value="", placeholder="如 000725")
+    ticker = ticker_input("股票代码", key="st_ticker")
+    c2, c3 = st.columns(2)
     trade_date = c2.date_input("分析日期", value=date.today()).strftime("%Y-%m-%d")
     intent = c3.text_input("你的诉求（可选）", key="intent_input",
                            placeholder="如：连板想追 / 被套要不要割")
@@ -263,6 +264,42 @@ with tab_screen:
             with st.expander("候选池原始数据"):
                 st.json(sc[2])
             st.download_button("下载推荐 (md)", sc[1], file_name="screener.md")
+            _render_deep_review_trigger(sc)
+
+    def _render_deep_review_trigger(sc):
+        """#4 融合：推荐 TOP3 → 主线深度辩论（手动触发，每票 15-20 分钟）。"""
+        st.divider()
+        st.markdown("#### 主线深度辩论")
+        st.caption("把推荐中的 TOP 3 代码送主线 7 分析师全链路辩论（每票约 15-20 分钟，"
+                   "产生完整报告与 5 档评级）。手动触发，成本可控。")
+        trade_date = (sc[2] or {}).get("trade_date") or ""
+        if st.button("对推荐 TOP 3 跑深度辩论", type="primary", key="dr_trigger"):
+            def _deep():
+                from tradingagents.shortterm import deep_review
+                report_text = sc[1]
+                picks = screener.extract_picks(report_text, 3)
+                results = []
+                for code in picks:
+                    results.append(deep_review.run_deep_review(
+                        code, trade_date, reason="扫描TOP N深度辩论"))
+                return {"trade_date": trade_date, "picks": picks, "results": results}
+            job_id = start_job("deep_review", _deep)
+            st.session_state["dr_job"] = job_id
+            st.rerun()
+
+    def _render_deep_review_result(dr):
+        if not dr.get("results"):
+            st.warning("报告中未解析出股票代码，无法深度辩论")
+            return
+        rows = []
+        for r in dr["results"]:
+            rows.append({
+                "代码": r.get("ticker"),
+                "触发": r.get("reason", ""),
+                "主线评级": r.get("signal") if r.get("ok") else "失败",
+                "报告": r.get("report_path") or r.get("error") or "",
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
 
     sjob = get_job(st.session_state.get("screen_job", "")) or get_job(latest_job_id("screen") or "") or {}
     sstatus = sjob.get("status")
@@ -287,12 +324,38 @@ with tab_screen:
     elif st.session_state.get("sc_result"):
         _render_screen_result(st.session_state["sc_result"])
 
+    # #4 深度辩论 job 状态（独立 kind，与扫描互不干扰）
+    drjob = get_job(st.session_state.get("dr_job", "")) or get_job(latest_job_id("deep_review") or "") or {}
+    drstatus = drjob.get("status")
+    if drstatus in ("queued", "running"):
+        @st.fragment(run_every=30)
+        def _poll_dr():
+            j = get_job(st.session_state.get("dr_job", "")) or get_job(latest_job_id("deep_review") or "") or {}
+            if j.get("status") in ("queued", "running"):
+                st.info("主线深度辩论进行中（每票 15-20 分钟）… 可切换页面，任务不中断")
+            else:
+                st.rerun()
+
+        _poll_dr()
+    elif drstatus == "done":
+        _render_deep_review_result(drjob["result"])
+    elif drstatus == "error":
+        st.error(f"深度辩论失败: {drjob['error']}")
+        if st.button("清除", key="dr_clear"):
+            clear_job(st.session_state.pop("dr_job", latest_job_id("deep_review") or ""))
+            st.rerun()
+
 with tab_hist:
     records = list_records()
     if not records:
         st.caption("暂无短线历史记录（个股决策/选股完成后自动落盘）")
     else:
         from datetime import datetime as _dt
+
+        st.caption("🔀 跨方式纵向对比（短线/持仓/扫描/深复核/主线 统一注册表）")
+        st.page_link("pages/3_分析对比.py",
+                     label="打开「分析对比」页：同票时间线 + 规则/LLM 对比 + 盘后验证 + 误差报告",
+                     icon="🔀")
 
         st.subheader("📊 复盘胜率")
         with st.spinner("聚合全部已评分决策…"):

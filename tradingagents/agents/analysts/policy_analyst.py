@@ -14,6 +14,7 @@ def create_policy_analyst(llm):
     def policy_analyst_node(state):
         current_date = state["trade_date"]
         instrument_context = build_instrument_context(state["company_of_interest"])
+        market_pulse = state.get("market_pulse") or ""
 
         tools = [
             get_news,
@@ -44,6 +45,9 @@ def create_policy_analyst(llm):
             "\n3. 政策影响力度评级（强/中/弱）"
             "\n4. 政策影响时间窗口估算"
             "\n5. 政策面总体评级"
+            "\n\n📡 短线盘面信号参考（ch0 异动精扫 + 市场情绪温度计，来自短线系统）:"
+            "\n{market_pulse}"
+            "\n若异动清单/情绪温度计显示异常活跃或过热，注意交叉验证其是否由近期政策事件驱动，并在报告中注明。"
             + get_language_instruction()
         )
 
@@ -68,6 +72,7 @@ def create_policy_analyst(llm):
         prompt = prompt.partial(tool_names=", ".join([tool.name for tool in tools]))
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
+        prompt = prompt.partial(market_pulse=market_pulse)
 
         chain = prompt | llm.bind_tools(tools)
         result = chain.invoke(state["messages"])

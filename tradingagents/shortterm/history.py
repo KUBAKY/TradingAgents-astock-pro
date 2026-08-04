@@ -103,6 +103,11 @@ def save_stock_record(result: dict, inputs: dict) -> Path | None:
     path = _DIR / f"{ch0['ticker']}_{ch0['trade_date']}_{ts}.json"
     with _LOCK:
         _atomic_write(path, payload)
+    try:
+        from tradingagents.analysis_registry.registry import register_stock_record
+        register_stock_record(payload, str(path))
+    except Exception:
+        pass
     return path
 
 
@@ -119,6 +124,11 @@ def save_screen_record(scan_result: dict, report: str | None) -> Path:
     path = _DIR / f"screener_{scan_result['trade_date']}_{ts}.json"
     with _LOCK:
         _atomic_write(path, payload)
+    try:
+        from tradingagents.analysis_registry.registry import register_screen_record
+        register_screen_record(payload, str(path))
+    except Exception:
+        pass
     return path
 
 

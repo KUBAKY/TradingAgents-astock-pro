@@ -7,6 +7,7 @@ def create_social_media_analyst(llm):
     def social_media_analyst_node(state):
         current_date = state["trade_date"]
         instrument_context = build_instrument_context(state["company_of_interest"])
+        market_pulse = state.get("market_pulse") or ""
 
         tools = [
             get_news,
@@ -28,6 +29,8 @@ def create_social_media_analyst(llm):
             "\n3. 排名前 3 的舆情主题"
             "\n4. 情绪评分（极度悲观/悲观/中性/乐观/极度乐观）"
             "\n5. 情绪趋势变化方向（升温/降温/平稳）"
+            "\n\n📡 短线盘面信号参考（ch0 异动精扫 + 市场情绪温度计，来自短线系统）:"
+            "\n{market_pulse}"
             + get_language_instruction()
         )
 
@@ -52,6 +55,7 @@ def create_social_media_analyst(llm):
         prompt = prompt.partial(tool_names=", ".join([tool.name for tool in tools]))
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
+        prompt = prompt.partial(market_pulse=market_pulse)
 
         chain = prompt | llm.bind_tools(tools)
 

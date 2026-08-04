@@ -25,6 +25,19 @@ from .history import parse_decision, save_stock_record
 _DIR_ENV = "TRADINGAGENTS_PORTFOLIO_DIR"
 _LOCK = threading.Lock()
 
+# #2 融合：触发主线深度复核的高危异动类型（ch0 anomaly type）
+HIGH_RISK_ANOMALY_TYPES = ("retail_takeover", "margin_risk", "overheat")
+
+
+def _needs_deep_review(ch0: dict | None, direction: str | None) -> bool:
+    """#2 触发条件：决策卡方向=卖出 或 ch0 高危异动（散户接力/融资风险/过热）。"""
+    if direction == "卖出":
+        return True
+    if not ch0:
+        return False
+    return any(a.get("type") in HIGH_RISK_ANOMALY_TYPES
+               for a in (ch0.get("anomalies") or []))
+
 
 def portfolio_dir() -> Path:
     env = __import__("os").environ.get(_DIR_ENV)
@@ -238,11 +251,17 @@ def list_snapshots() -> list[str]:
 
 def run_daily_follow(trade_date: str, provider: str = "deepseek",
                      model: str = "deepseek-v4-flash", base_url: Optional[str] = None,
-                     force: bool = False, positions: Optional[list[dict]] = None) -> dict:
+                     force: bool = False, positions: Optional[list[dict]] = None,
+                     max_deep_reviews: int = 2,
+                     deep_review_config: Optional[dict] = None) -> dict:
     """对每只持仓跑完整决策（割/持/补），结果并入快照落盘。
 
     幂等：当日快照已存在且非 force → 直接返回 {"skipped": True}。
     单票失败 → results 行内 error，继续其余；failed 计数。
+
+    #2 融合：决策卡方向=卖出 或 ch0 高危异动（散户接力/融资风险/过热）
+    → 跟进完成后串行跑主线深度复核（上限 max_deep_reviews 票/日，防成本爆炸），
+    结论（5 档评级 + 报告路径）写入对应 entry。
     """
     existing = load_snapshot(trade_date)
     if existing is not None and not force:
@@ -252,12 +271,15 @@ def run_daily_follow(trade_date: str, provider: str = "deepseek",
     run = _import_pipeline()  # 测试可先 monkeypatch portfolio.pipeline_run 再进入
     results = []
     failed = 0
+    review_queue: list[tuple[dict, dict]] = []  # (position, entry)
     for p in positions if positions is not None else _load_positions():
         entry = {
             "ticker": p["ticker"], "name": p.get("name", ""),
             "cost_price": p["cost_price"], "shares": p["shares"],
             "direction": None, "confidence": None,
             "cost_cny": None, "report_path": None, "error": None,
+            "deep_review": False, "deep_review_signal": None,
+            "deep_review_path": None,
         }
         try:
             result = run(p["ticker"], trade_date,
@@ -273,23 +295,42 @@ def run_daily_follow(trade_date: str, provider: str = "deepseek",
                 entry["cost_cny"] = round(cost_summary["total_cost_cny"], 4)
             path = save_stock_record(result, {"kind": "follow", "trade_date": trade_date})
             entry["report_path"] = str(path) if path else None
+
+            ch0 = result.get("ch0")
+            if _needs_deep_review(ch0, entry["direction"]):
+                entry["deep_review"] = True
+                review_queue.append((p, entry))
         except Exception as e:
             entry["error"] = str(e) or "跟进失败"
             failed += 1
         results.append(entry)
+
+    dr_run = _import_deep_review()
+    for p, entry in review_queue[:max_deep_reviews]:
+        dr = dr_run(p["ticker"], trade_date,
+                    reason=f"持仓异常复核(方向={entry['direction']})",
+                    config=deep_review_config)
+        if dr.get("ok"):
+            entry["deep_review_signal"] = dr.get("signal")
+            entry["deep_review_path"] = dr.get("report_path")
+        else:
+            entry["deep_review_error"] = dr.get("error", "深度复核失败")
 
     snap = take_snapshot(trade_date)
     payload = load_snapshot(trade_date) or {}
     payload["results"] = results
     payload["failed"] = failed
     payload["followed_ts"] = int(time.time())
+    payload["deep_reviewed"] = sum(1 for r in results if r.get("deep_review"))
     _atomic_write(snap, payload)
     return {"date": trade_date, "skipped": False, "snapshot": payload,
-            "results": results, "failed": failed}
+            "results": results, "failed": failed,
+            "deep_reviewed": payload["deep_reviewed"]}
 
 
 # 模块级别名，便于测试 monkeypatch
 pipeline_run = None
+deep_review_run = None
 
 
 def _import_pipeline():
@@ -297,3 +338,10 @@ def _import_pipeline():
     if pipeline_run is None:
         from .pipeline import run as pipeline_run
     return pipeline_run
+
+
+def _import_deep_review():
+    global deep_review_run
+    if deep_review_run is None:
+        from .deep_review import run_deep_review as deep_review_run
+    return deep_review_run

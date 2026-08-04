@@ -106,6 +106,123 @@ def activity_rank(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=lambda r: -r["activity_score"])
 
 
+def fetch_market_sentiment(trade_date: str | None = None) -> dict:
+    """情绪周期温度计：涨停家数/最高连板/跌停家数 → 五档情绪。
+
+    数据源（均走 _em_get 限流）：
+    - 东财涨停池 push2ex getTopicZTPool：当日全部涨停 + 连板数 lbc（1 请求）
+    - clist f3 升序跌幅榜 top100：跌停家数近似
+    失败返回 sentiment=unknown，调用方降级为无温度计（不阻塞扫描）。
+
+    五档（《投资分析体系》v1.1 阈值 + 中档插值）：
+    - 高潮: 涨停>100
+    - 冰点: 涨停<20 且最高连板<3
+    - 退潮: 涨停<20 但最高连板≥3（高度还在、家数萎缩），或跌停≥20 且涨停<40
+    - 修复: 涨停 20-39
+    - 升温: 涨停 40-100
+    """
+    trade_date = trade_date or datetime.now().strftime("%Y-%m-%d")
+    limit_up_count = max_streak = None
+    try:
+        url = "https://push2ex.eastmoney.com/getTopicZTPool"
+        params = {
+            "ut": "7eea3edcaed734bea9cbfc24409ed989", "dpt": "wz.ztzt",
+            "Pageindex": "0", "pagesize": "600", "sort": "fbt:asc",
+            "date": trade_date.replace("-", ""),
+        }
+        pool = ((_em_get(url, params=params, timeout=15).json().get("data")
+                 or {}).get("pool")) or []
+        limit_up_count = len(pool)
+        max_streak = max(int(p.get("lbc") or 1) for p in pool) if pool else 0
+    except Exception:
+        return {"sentiment": "unknown", "limit_up_count": None,
+                "max_streak": None, "limit_down_count": None,
+                "label": "数据缺失"}
+
+    limit_down_count = None
+    try:
+        url2 = "https://push2.eastmoney.com/api/qt/clist/get"
+        params2 = {
+            "pn": "1", "pz": "100", "po": "0", "np": "1",
+            "fltt": "2", "invt": "2", "fid": "f3",
+            "fs": "m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f3,f12,f14",
+        }
+        diff = (_em_get(url2, params=params2, timeout=15).json()
+                .get("data") or {}).get("diff") or []
+        limit_down_count = sum(1 for row in diff
+                               if (row.get("f3") or 0) <= -9.5)
+    except Exception:
+        pass
+
+    up, streak, down = limit_up_count, max_streak or 0, limit_down_count or 0
+    if up > 100:
+        label, score = "高潮", 90
+    elif up < 20 and streak < 3:
+        label, score = "冰点", 10
+    elif up < 20 and streak >= 3 or (down >= 20 and up < 40):
+        label, score = "退潮", 25
+    elif up < 40:
+        label, score = "修复", 45
+    else:
+        label, score = "升温", 70
+    return {
+        "sentiment": "ok", "limit_up_count": up, "max_streak": streak,
+        "limit_down_count": down, "label": label, "score": score,
+    }
+
+
+def assign_tiers(candidates: list[dict]) -> list[dict]:
+    """板块梯队五档标注（原地写 row["tier"]/row["tier_reason"]，返回同列表）。
+
+    规则（《A股投资分析体系》板块梯队）：
+    - 龙头：板块内 activity 第一且连板≥1；板块无涨停时取 activity 第一
+    - 龙二/龙三：龙头之后 activity 前二且连板≥1
+    - 中位股：连板≥2 但不在板块 activity 前三（风险收益比差，容易 A 杀）
+    - 低位补涨：无连板且近7日涨幅>5%，板块内已有龙头涨停（补涨启动）
+    - 跟风杂毛：其余（涨停晚/封单弱/纯跟风，建议回避）
+    """
+    by_industry: dict[str, list[dict]] = {}
+    for r in candidates:
+        by_industry.setdefault(r.get("industry") or "", []).append(r)
+
+    for rows in by_industry.values():
+        ordered = sorted(rows, key=lambda r: -float(r.get("activity_score") or 0))
+        limits = [int((r.get("ch0") or {}).get("limit_up_streak") or 0) for r in ordered]
+        has_leader = any(limit >= 1 for limit in limits)
+        leader_idx = next((i for i, limit in enumerate(limits) if limit >= 1), 0)
+        leader_mark = set()
+        leader_mark.add(leader_idx)
+        dragons = [i for i in range(leader_idx + 1, len(ordered))
+                   if limits[i] >= 1][:2]
+        leader_mark.update(dragons)
+
+        for i, r in enumerate(ordered):
+            limit = limits[i]
+            if i == leader_idx:
+                if has_leader:
+                    r["tier"] = "龙头"
+                    r["tier_reason"] = f"板块 activity 第一且连板 {limit} 板，板块最强"
+                else:
+                    r["tier"] = "龙头"
+                    r["tier_reason"] = "板块无涨停，取 activity 第一为龙头（缺涨停确认）"
+            elif i in leader_mark:
+                r["tier"] = "龙二" if i == dragons[0] else "龙三"
+                r["tier_reason"] = f"板块 activity 第{i + 1}且连板 {limit} 板，跟随龙头"
+            elif limit >= 2:
+                r["tier"] = "中位股"
+                r["tier_reason"] = (f"连板 {limit} 但不在板块前三，风险收益比差，"
+                                    "容易A杀，回避")
+            elif limit == 0 and has_leader \
+                    and ((r.get("ch0") or {}).get("ret_7d_pct") or 0) > 5:
+                r["tier"] = "低位补涨"
+                r["tier_reason"] = "无连板但近7日涨幅>5%，板块龙头已涨停，补涨启动"
+            else:
+                r["tier"] = "跟风杂毛"
+                r["tier_reason"] = "无连板/涨幅不足，纯跟风，封单弱建议回避"
+    return candidates
+
+
 def _concept_tags(code: str) -> str:
     """百度股市通概念标签（不限流，线程池内并行调用）。"""
     try:
@@ -181,15 +298,20 @@ def scan(capital: float | None = None, per_board: int = 8,
                 else:
                     rejected.append({"code": row["code"], "name": row["name"],
                                      "reason": reason})
-        result["boards"][board] = candidates
+        result["boards"][board] = assign_tiers(candidates)
         result["rejected"][board] = rejected
 
+    result["market_sentiment"] = fetch_market_sentiment(trade_date)
     return result
 
 
 SCREENER_PROMPT = """你是A股短线选股顾问（v2：打分横评版）。以下是程序化三级扫描后的候选池（三排序键合并快照→活跃度粗排→黑名单/异动精扫）。用户资金 {capital} 元。
 
-候选池字段说明：main_net_inflow_yi=当日主力净流入(亿元)，main_net_inflow_pct=主力净占比(%)，industry=行业板块，concepts=概念题材标签，ch0.anomalies=异动信号列表，ch0.overheated=过热标记，ch0.mode=模式提示(超短/波段)，ch0.ret_7d_pct/ret_30d_pct=近7/30日涨幅，ch0.limit_up_streak=连板数，ch0.lhb_10d=近10日龙虎榜次数，ch0.data_gaps=数据缺口（均为扫描时点实时快照）。history=你过去对该票的判断及事后验证（date=判断日，direction=当时方向，t1_pct/t3_pct=事后T+1/T+3收益%，verdict=对/错；无记录或失败为空列表）。
+市场情绪背景（情绪温度计）：{market_sentiment}
+
+主题热度统计（候选池概念聚合）：{theme_stats}
+
+候选池字段说明：main_net_inflow_yi=当日主力净流入(亿元)，main_net_inflow_pct=主力净占比(%)，industry=行业板块，concepts=概念题材标签，tier=板块梯队(龙头/龙二/龙三/中位股/低位补涨/跟风杂毛)，tier_reason=梯队依据，ch0.anomalies=异动信号列表，ch0.overheated=过热标记，ch0.mode=模式提示(超短/波段)，ch0.ret_7d_pct/ret_30d_pct=近7/30日涨幅，ch0.limit_up_streak=连板数，ch0.lhb_10d=近10日龙虎榜次数，ch0.data_gaps=数据缺口（均为扫描时点实时快照）。history=你过去对该票的判断及事后验证（date=判断日，direction=当时方向，t1_pct/t3_pct=事后T+1/T+3收益%，verdict=对/错；无记录或失败为空列表）。
 
 任务分四步：
 
@@ -210,8 +332,15 @@ SCREENER_PROMPT = """你是A股短线选股顾问（v2：打分横评版）。�
 
 4. **误杀复核**：下方 rejected 列表是程序化剔除的票及原因，复核是否有误杀；有误杀说明理由并重新纳入，无误杀简述剔除逻辑成立。
 
+5. **主题生命周期判断**：对主题热度统计中高频主题（≥2 票），判断其生命周期阶段（兴起→扩散→过热→兑现→退潮→沉寂）并给依据（新闻热度/股价位置/连板高度/板块内梯队分布）：
+   - 兴起/扩散阶段：龙头可参与，低位补涨可升一档
+   - 过热阶段（连板高度高+梯队扩散到跟风杂毛）：仅龙头可低吸，补涨票降一档
+   - 兑现/退潮阶段：禁止参与，候选池内相关票降一档
+   - 沉寂阶段：忽略
+
 纪律：
 - 标注 overheated=true 的票只能建议"等回踩"，不能建议追
+- 梯队纪律：中位股（连板≥2 但非板块前三）风险收益比差、容易 A 杀，禁止进入操作计划；跟风杂毛（无连板、封单弱）不进入操作计划；龙头/龙二龙三优先，低位补涨需板块龙头未走弱才考虑
 - 主力大幅净流出(main_net_inflow_yi 显著为负)且上涨的票，警惕出货，降一档处理
 - 数据缺失(data_gaps非空)的票降一档处理；lhb_10d=0 且无主力净流入的纯情绪票降一档
 - 该票 history 中近期判断多次判错（verdict=错 ≥2）或 T+3 持续为负的，说明上次错在哪、本次为何不同，否则降一档；history 为空的不额外加分
@@ -246,6 +375,58 @@ def _candidate_history(code: str, before_date: str) -> list[dict]:
     return out
 
 
+def _theme_stats(scan_result: dict) -> str:
+    """候选池概念聚合频次 → prompt 主题热度文本（TOP5）。"""
+    from collections import Counter
+    cnt: Counter = Counter()
+    for rows in scan_result.get("boards", {}).values():
+        for r in rows:
+            for tag in (r.get("concepts") or "").split("/"):
+                tag = tag.strip()
+                if tag:
+                    cnt[tag] += 1
+    if not cnt:
+        return "（候选池无概念标签）"
+    mains = [f"{t}({c}票)" for t, c in cnt.most_common(5)]
+    return "、".join(mains)
+
+
+def _sentiment_text(s: dict | None) -> str:
+    """情绪温度计 → prompt 可读文本（含档位纪律提示）。"""
+    if not s or s.get("sentiment") != "ok":
+        return "（温度计数据缺失，忽略该层，正常打分）"
+    hint = {
+        "冰点": "涨停不足20家且无高度，情绪冰点：整体降一档打分，空仓优先，严禁追高",
+        "退潮": "涨停家数萎缩/跌停潮，情绪退潮：高位连板票严禁参与，仅关注抗跌龙头",
+        "修复": "涨停20-40家，情绪修复：可正常参与，优先板块龙头",
+        "升温": "涨停40-100家，情绪升温：积极，可参与补涨",
+        "高潮": "涨停超100家，情绪高潮：过热分歧临近，不追高位，控制仓位",
+    }[s["label"]]
+    return (f"{s['label']}（涨停 {s['limit_up_count']} 家 / "
+            f"最高连板 {s['max_streak']} 板 / 跌停 {s['limit_down_count']} 家）。{hint}")
+
+
+# 主流 A 股代码前缀（沪主板/深主板/创业板/科创板/北交所），排除价格/日期/股数等假阳性
+_PICK_RE = re.compile(
+    r"(?<!\d)(?:00[0132]\d{3}|30[012]\d{3}|60[0135]\d{3}|68[89]\d{3}"
+    r"|82\d{4}|83\d{4}|87\d{4}|88\d{4}|43\d{4}|92\d{4})(?![\d.])")
+
+
+def extract_picks(report_text: str, n: int = 3) -> list[str]:
+    """从推荐报告文本提取 TOP N 股票代码（按出现顺序去重）。
+
+    #4 融合：扫描推荐（文本）→ 主线深度辩论的输入解析。
+    只认主流 A 股代码前缀，过滤价格/日期/股数等数字假阳性。
+    """
+    seen: list[str] = []
+    for code in _PICK_RE.findall(report_text or ""):
+        if code not in seen:
+            seen.append(code)
+        if len(seen) >= n:
+            break
+    return seen
+
+
 def recommend(scan_result: dict, provider: str, model: str,
               base_url: str | None = None) -> str:
     _cost.cost_context("screener", None)  # 单次推荐，账本记 feature 分组
@@ -258,6 +439,8 @@ def recommend(scan_result: dict, provider: str, model: str,
     }
     prompt = (SCREENER_PROMPT
               .replace("{capital}", f"{scan_result['capital']:,.0f}" if scan_result.get("capital") else "未提供")
+              .replace("{market_sentiment}", _sentiment_text(scan_result.get("market_sentiment")))
+              .replace("{theme_stats}", _theme_stats(scan_result))
               .replace("{candidates}", json.dumps(slim, ensure_ascii=False, indent=1))
               .replace("{rejected}", json.dumps(scan_result.get("rejected", {}), ensure_ascii=False, indent=1)))
     llm = build_llm(provider, model, base_url)

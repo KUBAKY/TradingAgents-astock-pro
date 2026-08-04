@@ -1,11 +1,15 @@
 # TradingAgents/graph/propagation.py
 
+import logging
+
 from typing import Dict, Any, List, Optional
 from tradingagents.agents.utils.agent_states import (
     AgentState,
     InvestDebateState,
     RiskDebateState,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Propagator:
@@ -19,11 +23,13 @@ class Propagator:
         self, company_name: str, trade_date: str, past_context: str = ""
     ) -> Dict[str, Any]:
         """Create the initial state for the agent graph."""
+        market_pulse = self._build_market_pulse(company_name, trade_date)
         return {
             "messages": [("human", company_name)],
             "company_of_interest": company_name,
             "trade_date": str(trade_date),
             "past_context": past_context,
+            "market_pulse": market_pulse,
             "investment_debate_state": InvestDebateState(
                 {
                     "bull_history": "",
@@ -56,6 +62,19 @@ class Propagator:
             "hot_money_report": "",
             "lockup_report": "",
         }
+
+    @staticmethod
+    def _build_market_pulse(company_name: str, trade_date: str) -> str:
+        """短线盘面信号（ch0 异动精扫 + 情绪温度计），零 LLM 成本。
+
+        lazy import 防 graph→shortterm 循环依赖；失败降级为空串。
+        """
+        try:
+            from tradingagents.shortterm.pulse import build_market_pulse
+            return build_market_pulse(company_name, str(trade_date))
+        except Exception as e:
+            logger.warning("market_pulse build failed for %s: %s", company_name, e)
+            return ""
 
     def get_graph_args(
         self,

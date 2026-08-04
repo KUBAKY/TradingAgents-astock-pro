@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import threading
 import traceback
+from pathlib import Path
 from typing import Any
 
 from web.history import clear_incomplete_task, record_incomplete_task
@@ -179,6 +180,19 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
 
         tracker.mark_complete(last_chunk, signal)
         clear_incomplete_task(ticker, trade_date)
+        try:
+            from tradingagents.analysis_registry.registry import (
+                register_mainline_record,
+            )
+
+            log_path = (
+                Path.home() / ".tradingagents" / "logs" / ticker
+                / "TradingAgentsStrategy_logs" / f"full_states_log_{trade_date}.json"
+            )
+            if log_path.exists():
+                register_mainline_record(ticker, trade_date, str(log_path), final_chunk)
+        except Exception:
+            pass
     finally:
         graph.close_graph_run()
 
