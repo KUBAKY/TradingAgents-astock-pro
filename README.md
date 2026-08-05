@@ -396,6 +396,10 @@ TradingAgents-Astock/
 
 本项目基于 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) 开源项目进行 A 股特化改造。感谢原作者的出色工作和 Apache 2.0 开源精神。
 
+- **上游原版**：[TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) — 多 Agent 投研框架原作者
+- **直接 fork 来源**：[simonlin1212/TradingAgents-astock](https://github.com/simonlin1212/TradingAgents-astock) — 本项目的前身仓库（A 股特化 fork）
+- 本仓库在其基础上继续演进（短线决策闭环、统一分析注册表、盘后自动验证等），同继承 Apache 2.0 许可证
+
 **原始论文**：[TradingAgents: Multi-Agents LLM Financial Trading Framework](https://arxiv.org/abs/2412.20138)
 
 ---
