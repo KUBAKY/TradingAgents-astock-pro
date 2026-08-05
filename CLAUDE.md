@@ -53,10 +53,12 @@
 
 ## 已知问题与注意事项
 
-### 依赖冲突（v0.2.6 已缓解）
-mootdx 钉死 `httpx>=0.25,<0.26`，与 langchain-google-genai 所需的 `httpx>=0.28.1` **结构性冲突**（该区间内每个 google-genai 版本都要 0.28.1，无解）。
+### 依赖冲突（v0.2.6 已缓解，v0.4.0 再解一层）
+mootdx 钉死 `httpx>=0.25,<0.26`，与 langchain-google-genai 所需的 `httpx>=0.28.1` **结构性冲突**（该区间内每个 google-genai 版本都要 0.28.1，无解）。[google] extra 已移除（#87），详见 pyproject.toml 注释。
 
-**v0.3.1 起 `[google]` extra 已移除**（#87）：uv 构建覆盖所有 extra 的 universal lock，extra 存在就让**所有人**的 `uv sync` 失败。留空更糟（`pip install .[google]` 静默装空）。需要 Gemini 时显式装 `pip install --no-deps "langchain-google-genai>=4.0.0"` + `pip install "google-genai>=1.53.0" "httpx>=0.28.1"`；`google_client.py` 导入失败会打印这两条命令。⚠️ 新增依赖后务必跑 `uv lock --dry-run` 验证——**pip 能装通不代表 uv 能锁**。
+**claude-agent-sdk ↔ mootdx 同源冲突（v0.4.0 已解）**：sdk（含最新 0.2.130）声明 `mcp<2.0.0`，而 mcp 1.x 全部要求 `httpx>=0.27.1`，与 mootdx 的 `httpx<0.26` 无解冲突（sdk→mcp→httpx 链必然撞 mootdx）。解法：`[tool.uv] override-dependencies = ["httpx>=0.27.1,<0.28"]` 强制 httpx 0.27.x（mootdx 的 httpx 仅用于复权/节假日工具模块，核心 K 线走 pytdx TCP，0.25→0.27 无破坏性变更）。⚠️ 切勿升 sdk 到 mcp 2.0 兼容版（不存在）；mcp 2.0.0 会让 sdk 的 `create_sdk_mcp_server` 炸 `Server.list_tools` AttributeError（mcp 2.0 顶层 Server 无该方法）。
+
+**⚠️ 新增依赖后务必跑 `uv lock` 验证**——pip 能装通不代表 uv 能锁。
 
 ### akshare 已移除（v0.2.5）
 v0.2.5 起完全移除 akshare 依赖，所有数据通过直连 HTTP API 获取。

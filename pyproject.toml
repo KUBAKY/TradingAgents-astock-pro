@@ -42,10 +42,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 走个人 Claude Pro/Max 订阅额度（而非按 token 计费的 Anthropic API）。
-# 依赖链为 claude-agent-sdk → mcp → httpx2，**不碰 httpx**，故与 mootdx 的
-# httpx<0.26 无冲突（已 uv lock 实测）——与 #87 移除的 [google] 情况不同。
-agentsdk = ["claude-agent-sdk>=0.2.82"]
+agentsdk = ["claude-agent-sdk>=0.2.130"]
+
+[tool.uv]
+# claude-agent-sdk（含最新 0.2.130）声明 mcp<2.0.0，而 mcp 1.x 全部要求
+# httpx>=0.27.1，与 mootdx 0.11.7 钉死的 httpx>=0.25,<0.26 结构性冲突（#87 同源）。
+# mootdx 的 httpx 仅用于复权/节假日等工具模块（核心 K 线走 pytdx TCP），
+# httpx 0.25→0.27 无破坏性变更 → override 强制 0.27.x 是安全解。
+override-dependencies = ["httpx>=0.27.1,<0.28"]
 
 [project.urls]
 Homepage = "https://github.com/simonlin1212/tradingagents-astock"
@@ -91,4 +95,9 @@ markers = [
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
 ]

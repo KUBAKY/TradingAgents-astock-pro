@@ -487,6 +487,7 @@ pyproject.toml:
 
 ### 踩坑记录（本期）
 
+- **agent_sdk pre-existing 2 失败已修（⑪ 收尾）**：根因 sdk（0.2.95）`create_sdk_mcp_server` 用 mcp 1.x 的 `@server.list_tools()` decorator，而 uv 无约束时锁了 mcp 2.0.0（其顶层 Server=lowlevel 无该方法）；mcp 1.x 又要 httpx>=0.27.1 撞 mootdx<0.26 → 解：sdk 升 0.2.130 + `[tool.uv] override-dependencies=["httpx>=0.27.1,<0.28"]`（mootdx httpx 仅工具模块，0.25→0.27 无破坏变更，实测 httpx get 200 + 全量 564 passed）；顺带把 pytest 纳入 dev 依赖（此前裸 pip 装，被 uv sync 清除）
 - 东财 `push2ex.getStockFenShi` 返回 rc=102；`push2his trends2` 带 beticks 但 SSL 持续 `DECRYPTION_FAILED_OR_BAD_RECORD_MAC` → 竞价主源锁定 `push2.eastmoney.com/api/qt/stock/details/get`（`pos=0&pageSize=5000` 单请求全量）
 - 东财 search-api 新闻接口会临时返回 0 条（关键词级风控/空），必须留新浪兜底
 - 竞价 tick 格式 `time,price,vol,...`，09:25:00 末笔=匹配价；`details/get` 周末返回最近交易日，trade_date 仅作缓存键，防旧数据靠 ch0 窗口门控
