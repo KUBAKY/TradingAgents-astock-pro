@@ -279,7 +279,7 @@ streamlit run web/app.py
 
 ## 短线交易分析系统（v0.4.0+ 第二产品线）
 
-面向日内/隔日短线的决策闭环，与主线深度投研互补。功能全部集成在 Streamlit Web UI（侧边栏多页面，随 `tradingagents-web` 一并启动），个人数据落盘 `~/.tradingagents/`（不入库）。
+面向日内/隔日短线的决策闭环，与主线深度投研互补（主线见 [Web UI](#web-ui)）。功能全部集成在 Streamlit Web UI（侧边栏多页面，随 `tradingagents-web` 一并启动），个人数据落盘 `~/.tradingagents/`（不入库）。
 
 ### 页面功能
 
@@ -297,18 +297,20 @@ streamlit run web/app.py
 |------|------|------|
 | `com.tradingagents.close-scan` | 工作日 15:10 | 全市场异动精扫 → 自动选股 |
 | `com.tradingagents.close-portfolio` | 工作日 15:15 | 持仓每日跟进（割/持/补） |
-| `com.tradingagents.validate` | 工作日 15:35 | 分析注册表盘后自动验证（3/10 交易日窗口） |
+| `com.tradingagents.validate` | 工作日 15:35 | 分析注册表盘后自动验证（短线决策/持仓 3 交易日，选股/复盘等 10 交易日） |
 
-安装（plist 模板在 `scripts/`）：
+安装（plist 模板在 `scripts/`）。⚠️ 模板中的脚本路径硬编码了开发机路径，安装前先替换为你本机的项目绝对路径：
 
 ```bash
+# 将 plist 中的开发机路径替换为本机项目路径
+sed -i '' "s|/Users/liyaweimacbook/projects/TradingAgents-astock|$(pwd)|g" scripts/com.tradingagents.*.plist
 cp scripts/com.tradingagents.*.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.tradingagents.close-scan.plist
-launchctl load ~/Library/LaunchAgents/com.tradingagents.close-portfolio.plist
-launchctl load ~/Library/LaunchAgents/com.tradingagents.validate.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tradingagents.close-scan.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tradingagents.close-portfolio.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tradingagents.validate.plist
 ```
 
-也可直接运行脚本（不依赖 launchd）：
+也可直接运行脚本（需先在项目内 `uv sync` 装好依赖，脚本依赖 `.venv` 环境）：
 
 ```bash
 python scripts/close_scan.py          # 全市场扫描
