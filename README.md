@@ -277,6 +277,48 @@ streamlit run web/app.py
 
 ---
 
+## 短线交易分析系统（v0.4.0+ 第二产品线）
+
+面向日内/隔日短线的决策闭环，与主线深度投研互补。功能全部集成在 Streamlit Web UI（侧边栏多页面，随 `tradingagents-web` 一并启动），个人数据落盘 `~/.tradingagents/`（不入库）。
+
+### 页面功能
+
+| 页面 | 功能 |
+|------|------|
+| `1_短线分析.py` | 个股决策：ch0 异动精扫（量价异动/资金流/龙虎榜/情绪温度计）→ 决策卡（方向/置信度/目标价/止损/适用周期）；全市场选股（板块梯队/情绪周期/主题生命周期/量价形态/融资风险线/散户席位/机构行为）；深度辩论（推荐 TOP3 走主线 7 分析师全链路复核）；复盘 tab（历史决策 → 盘后验证/对比） |
+| `2_持仓管理.py` | 持仓 CRUD + 每日跟进（割/持/补，幂等快照）+ 盈亏仪表盘 |
+| `3_分析对比.py` | 同票跨方式时间线（含验证列）、规则/手动 LLM 对比、手动补验证、误差报告 |
+
+### 盘后自动任务（launchd，macOS）
+
+工作日盘后自动运行，无需手动触发：
+
+| 任务 | 时间 | 说明 |
+|------|------|------|
+| `com.tradingagents.close-scan` | 工作日 15:10 | 全市场异动精扫 → 自动选股 |
+| `com.tradingagents.close-portfolio` | 工作日 15:15 | 持仓每日跟进（割/持/补） |
+| `com.tradingagents.validate` | 工作日 15:35 | 分析注册表盘后自动验证（3/10 交易日窗口） |
+
+安装（plist 模板在 `scripts/`）：
+
+```bash
+cp scripts/com.tradingagents.*.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.tradingagents.close-scan.plist
+launchctl load ~/Library/LaunchAgents/com.tradingagents.close-portfolio.plist
+launchctl load ~/Library/LaunchAgents/com.tradingagents.validate.plist
+```
+
+也可直接运行脚本（不依赖 launchd）：
+
+```bash
+python scripts/close_scan.py          # 全市场扫描
+python scripts/close_portfolio.py     # 持仓跟进
+python scripts/run_validations.py     # 盘后验证
+python scripts/run_feedback.py        # 误差报告
+```
+
+---
+
 ## 配置说明
 
 所有配置通过 `config` 字典传入，完整选项：
