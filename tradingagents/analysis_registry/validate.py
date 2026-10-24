@@ -18,6 +18,9 @@
 from __future__ import annotations
 
 import copy
+import os
+
+import pandas as pd
 import json
 import tempfile
 import threading
@@ -155,6 +158,77 @@ def _payload_from_ev(rec: dict, asof: str, ev: dict) -> dict:
     }
 
 
+
+# 观望的相对验证带：|超额收益| ≥ 该值才判「错过/正确」，否则「成立」
+SYSTEM_HOLD_BAND = float(os.environ.get("SYSTEM_HOLD_BAND", "0.05"))
+SYSTEM_BENCH = os.environ.get("SYSTEM_BENCH", "sh.000300")   # 沪深300
+
+
+def _bench_window_return(start_date: str, end_date: str) -> float | None:
+    """基准（默认沪深300）区间收益；失败返回 None（不静默当 0）。"""
+    import contextlib
+    import io
+
+    try:
+        import baostock as bs
+    except ImportError:
+        return None
+    rows = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        bs.login()
+    try:
+        rs = bs.query_history_k_data_plus(
+            SYSTEM_BENCH, "date,close", start_date=start_date,
+            end_date=end_date, frequency="d", adjustflag="3")
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+    finally:
+        with contextlib.redirect_stdout(io.StringIO()):
+            bs.logout()
+    if len(rows) < 2:
+        return None
+    try:
+        return float(rows[-1][1]) / float(rows[0][1]) - 1
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _eval_system(rec: dict, asof: str, df) -> dict:
+    """体系分析：方向为观望时走「相对基准」验证（AS-C8-07），其余复用 shortterm 评估。"""
+    full = _load_full(rec) or {}
+    direction = (full.get("parsed") or {}).get("direction")
+    if direction != "观望":
+        return _eval_shortterm(rec, asof, df)
+
+    rec_date = rec.get("trade_date") or ""
+    if df is None or getattr(df, "empty", True):
+        return {"verdict": "待验证", "verdict_basis": "缺K线"}
+    d = df.copy()
+    d["Date"] = pd.to_datetime(d["Date"])
+    d = d[d["Date"] >= pd.to_datetime(rec_date)].sort_values("Date").reset_index(drop=True)
+    if len(d) < 11:
+        return {"verdict": "待验证", "verdict_basis": f"记录日后仅 {max(0, len(d)-1)} 根K线，需 10 个交易日"}
+
+    entry = float(d["Close"].iloc[0])
+    end = float(d["Close"].iloc[10])
+    stock_ret = end / entry - 1
+    bench_ret = _bench_window_return(rec_date, str(d["Date"].iloc[10].date()))
+    if bench_ret is None:
+        return {"verdict": "待验证", "verdict_basis": "基准取数失败（沪深300）",
+                "entry_close": entry, "t10_close_pct": round(stock_ret * 100, 2)}
+
+    excess = stock_ret - bench_ret
+    band = SYSTEM_HOLD_BAND
+    if excess >= band:
+        verdict, basis = "观望错过", f"跑赢基准 {excess*100:+.1f}% ≥ {band*100:.0f}%"
+    elif excess <= -band:
+        verdict, basis = "观望正确", f"跑输基准 {excess*100:+.1f}%（≤ -{band*100:.0f}%）"
+    else:
+        verdict, basis = "观望成立", f"超额 {excess*100:+.1f}%，在 ±{band*100:.0f}% 带内"
+    return {"verdict": verdict, "verdict_basis": basis, "entry_close": entry,
+            "t10_close_pct": round(stock_ret * 100, 2)}
+
+
 def _eval_shortterm(rec: dict, asof: str, df) -> dict:
     """stock/follow/pick：原文即决策卡结构。"""
     full = _load_full(rec) or rec
@@ -229,7 +303,9 @@ def validate_record(rec: dict, asof: Optional[str] = None,
         kind = rec.get("kind")
         if kind == "screen":
             payload = _validate_screen(rec, asof)
-        elif kind in ("stock", "follow", "pick", "system"):
+        elif kind == "system":
+            payload = _payload_from_ev(rec, asof, _eval_system(rec, asof, df))
+        elif kind in ("stock", "follow", "pick"):
             payload = _payload_from_ev(rec, asof, _eval_shortterm(rec, asof, df))
         elif kind == "deep_review":
             payload = _payload_from_ev(rec, asof, _eval_deep_review(rec, asof, df))

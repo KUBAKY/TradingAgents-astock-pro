@@ -76,3 +76,66 @@ def test_buy_record_validated_by_rise(tmp_path, monkeypatch):
     out = validate_record(rec, asof="2026-11-13")
     assert out["kind"] == "system"
     assert out["verdict"] != "跳过"
+
+
+# ---------------------------------------------------------------------------
+# 观望的相对验证（AS-C8-07）
+# ---------------------------------------------------------------------------
+
+def _hold_rec(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADINGAGENTS_REGISTRY_DIR", str(tmp_path / "reg"))
+    monkeypatch.setenv("TRADINGAGENTS_SYSTEM_DIR", str(tmp_path / "sys"))
+    from scripts.register_system_analysis import register_one
+    rid = register_one("300308", "2026-10-23", "观望", paradigm="价值", score=55.6)
+    idx = json.loads((tmp_path / "reg" / "index.json").read_text(encoding="utf-8"))
+    return next(r for r in idx["records"] if r["id"] == rid)
+
+
+def _flat_days(pct=0.0, n=10):
+    rows = []
+    for i in range(1, n + 1):
+        px = 600.0 * (1 + pct * i)
+        rows.append((f"2026-11-{i+1:02d}", px, px))
+    return rows
+
+
+def test_hold_missed_when_stock_outperforms(tmp_path, monkeypatch):
+    from tradingagents.analysis_registry import validate as vmod
+    rec = _hold_rec(tmp_path, monkeypatch)
+    _mock_ohlcv(monkeypatch, _df(_flat_days(0.02)))          # 股票 +20%
+    monkeypatch.setattr(vmod, "_bench_window_return", lambda a, b: 0.01)  # 基准 +10%
+
+    out = validate_record(rec, asof="2026-11-13")
+    assert out["verdict"] == "观望错过"
+    assert "跑赢基准" in out["verdict_basis"]
+
+
+def test_hold_correct_when_stock_underperforms(tmp_path, monkeypatch):
+    from tradingagents.analysis_registry import validate as vmod
+    rec = _hold_rec(tmp_path, monkeypatch)
+    _mock_ohlcv(monkeypatch, _df(_flat_days(0.0)))            # 股票持平
+    monkeypatch.setattr(vmod, "_bench_window_return", lambda a, b: 0.10)  # 基准 +10%
+
+    out = validate_record(rec, asof="2026-11-13")
+    assert out["verdict"] == "观望正确"
+
+
+def test_hold_neutral_within_band(tmp_path, monkeypatch):
+    from tradingagents.analysis_registry import validate as vmod
+    rec = _hold_rec(tmp_path, monkeypatch)
+    _mock_ohlcv(monkeypatch, _df(_flat_days(0.01)))           # 股票 +10%
+    monkeypatch.setattr(vmod, "_bench_window_return", lambda a, b: 0.09)  # 超额 +1%
+
+    out = validate_record(rec, asof="2026-11-13")
+    assert out["verdict"] == "观望成立"
+
+
+def test_hold_pending_when_benchmark_missing(tmp_path, monkeypatch):
+    from tradingagents.analysis_registry import validate as vmod
+    rec = _hold_rec(tmp_path, monkeypatch)
+    _mock_ohlcv(monkeypatch, _df(_flat_days(0.01)))
+    monkeypatch.setattr(vmod, "_bench_window_return", lambda a, b: None)
+
+    out = validate_record(rec, asof="2026-11-13")
+    assert out["verdict"] == "待验证"
+    assert "基准" in out["verdict_basis"]
