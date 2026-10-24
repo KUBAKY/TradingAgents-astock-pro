@@ -6,11 +6,15 @@
 - **仓库**: https://github.com/simonlin1212/TradingAgents-astock
 - **协议**: Apache 2.0
 - **Python**: >=3.10
-- **当前版本**: 0.4.0
+- **当前版本**: 0.5.21（2026-10-23 按三批合入上游 v0.5.21；本地自研模块见下文）
 
 ## 架构
 
 ### 数据层（v0.2.5 全部直连 HTTP，零第三方数据库依赖）
+
+> **2026-10-23 上游合并（三批，基线 v0.5.21）**：数据层 `a_stock.py` 已与上游 3-way 合并——mootdx 调用统一走 `_mootdx_call`（失败即换服务器）、财报解析用上游超集、保留本地自研的 `get_auction_data` / `get_margin_data` / `get_lhb_seats` 与新闻翻页；llm_clients、graph、default_config 直接采用上游。上游新增 `tradingagents/dataflows/missing_data.py`（缺失数据追踪）与 `tradingagents/agents/utils/context.py`（`compact_history` 辩论历史压缩）。
+>
+> **本机网络限制**：通达信 TCP 7709 协议被拦（端口可连、协议不回包），mootdx 实际不可用，行情/财务会降级到新浪 HTTP。为此加了两个开关：`MOOTDX_TIMEOUT`（单台 socket 超时，默认 4s）、`MOOTDX_PROBE_BUDGET`（整轮探测总预算，默认 20s）；不设这两个值时一次取数可卡数分钟。
 | 来源 | 协议 | 数据 |
 |------|------|------|
 | mootdx | TCP 7709 | OHLCV K线、财务快照、F10 文本 |

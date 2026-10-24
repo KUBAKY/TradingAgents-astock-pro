@@ -3,14 +3,14 @@
 from tradingagents.agents.utils.agent_utils import get_language_instruction
 
 
+from tradingagents.agents.utils.context import compact_history
+
+
 def create_aggressive_debator(llm):
     def aggressive_node(state) -> dict:
         risk_debate_state = state["risk_debate_state"]
         history = risk_debate_state.get("history", "")
         aggressive_history = risk_debate_state.get("aggressive_history", "")
-
-        current_conservative_response = risk_debate_state.get("current_conservative_response", "")
-        current_neutral_response = risk_debate_state.get("current_neutral_response", "")
 
         market_research_report = state["market_report"]
         sentiment_report = state["sentiment_report"]
@@ -45,7 +45,7 @@ Company Fundamentals Report: {fundamentals_report}
 Policy Analysis Report: {policy_report}
 Hot Money / Capital Flow Report: {hot_money_report}
 Lockup Expiry / Insider Reduction Report: {lockup_report}
-Conversation history: {history} Last conservative argument: {current_conservative_response} Last neutral argument: {current_neutral_response}. If no responses yet, present your own argument.
+Conversation history: {compact_history(history)} If no responses yet, present your own argument.
 
 Engage actively, debate persuasively, and assert why aggressive positioning is optimal for this A-share opportunity. Output conversationally without special formatting.{get_language_instruction()}"""
 

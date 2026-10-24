@@ -3,14 +3,14 @@
 from tradingagents.agents.utils.agent_utils import get_language_instruction
 
 
+from tradingagents.agents.utils.context import compact_history
+
+
 def create_conservative_debator(llm):
     def conservative_node(state) -> dict:
         risk_debate_state = state["risk_debate_state"]
         history = risk_debate_state.get("history", "")
         conservative_history = risk_debate_state.get("conservative_history", "")
-
-        current_aggressive_response = risk_debate_state.get("current_aggressive_response", "")
-        current_neutral_response = risk_debate_state.get("current_neutral_response", "")
 
         market_research_report = state["market_report"]
         sentiment_report = state["sentiment_report"]
@@ -46,7 +46,7 @@ Company Fundamentals Report: {fundamentals_report}
 Policy Analysis Report: {policy_report}
 Hot Money / Capital Flow Report: {hot_money_report}
 Lockup Expiry / Insider Reduction Report: {lockup_report}
-Conversation history: {history} Last aggressive argument: {current_aggressive_response} Last neutral argument: {current_neutral_response}. If no responses yet, present your own argument.
+Conversation history: {compact_history(history)} If no responses yet, present your own argument.
 
 Demonstrate why a conservative stance is the safest path, especially given A-share market structure where downside protection mechanisms (stop-loss, same-day exit) are severely limited. Output conversationally without special formatting.{get_language_instruction()}"""
 

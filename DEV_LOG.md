@@ -526,6 +526,23 @@ pyproject.toml:
 - **测试**：新增 `tests/test_sina_financial_report.py` 4 例（report_list 解析 / 未公布不可见 / 行列表兼容 / 同名科目不覆盖）；全量 **568 passed / 1 skipped / 45 subtests**。
 - **遗留**：本地仍是 0.4.0，上游 v0.5.21（2026-10-11）另有 20 个版本条目未合入，清单见知识库《开源生态-simonlin1212投研矩阵》。
 
+## 上游合并（2026-10-23，v0.4.0 → v0.5.21）
+
+分支 `upstream-merge`，按三批合入 simonlin1212/TradingAgents-astock 的 61 个提交（merge-base 恰为 v0.4.0 tag），每批跑全量测试后提交。
+
+| 批次 | 范围 | 冲突处理 | 测试 |
+|------|------|----------|------|
+| 1 数据层 | `a_stock.py` 3-way + 新增 `missing_data.py` | 9 处冲突：mootdx 走 `_mootdx_call` 并弃用本地熔断器；财报解析用上游超集；保留本地 THS EPS 防御写法、自研 `get_auction_data`/`get_margin_data`/`get_lhb_seats`、新闻翻页 | 568 passed |
+| 2 超时与韧性 | `llm_clients` 9 文件、`default_config`、`graph/setup` 直采上游；`trading_graph` 3-way；`alpha_vantage_common` 上游；`pyproject` 合并 | 全部 0 冲突；版本 0.4.0 → 0.5.21，`langgraph>=1.0`（本机实装 1.2.10） | 568 passed / 42s |
+| 3 功能与提示词 | agents 8 文件 3-way、`context.py` 新增、utils 4 文件与 web/cli/main 直采上游 | 4 处冲突：风控三兄弟 import 取并集（`get_language_instruction` + `compact_history`）；情绪分析师 = 上游 9 项必采清单 + 本地短线盘面信号块 | 568 passed / 43s |
+
+**本地补丁（非上游）**
+
+- **mootdx 探测有界化**：本机网络拦截通达信 TCP 7709（端口通、协议不回包），上游默认 15s × 38 台逐台验证 → 一次取数卡 >90s 未返回。加 `MOOTDX_TIMEOUT`（默认 4s）与 `MOOTDX_PROBE_BUDGET`（默认 20s），实测「>90s 未返回」→ **34.7s 内降级到新浪取数**；测试耗时同步从 546s 降到 42s。
+- 上游 `_mootdx_call` 取代本地 `_MOOTDX_LOCK` + 熔断器（`_mootdx_alive` / `_trip_mootdx_breaker`），已删除本地死代码。
+
+**保留的本地增量（上游无）**：`tradingagents/shortterm/`、`tradingagents/analysis_registry/`、`tradingagents/cost/`、`web/pages/1-3_*.py`、`scripts/*` 与全部本地测试。
+
 ## 视频内容映射(EP12 - EP16)
 
 | 集数 | 主题 | 对应里程碑 |

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from datetime import date
+from pathlib import Path
 
 import streamlit as st
 
@@ -19,6 +22,122 @@ from web.history import (
     record_incomplete_task,
 )
 from web.components.ticker_input import ticker_input
+
+logger = logging.getLogger(__name__)
+
+# ── LLM config persistence ────────────────────────────────────────────────────
+# Saves model selection to a JSON file so it survives browser tab close/reopen.
+# 放用户目录而不是包目录：pip 安装时包目录在 site-packages（常只读、升级即清空），
+# git clone 用户则会在仓库里多出一个未跟踪文件。~/.tradingagents/ 是本项目其它用户态
+# 数据（logs / cache / memory）已经在用的位置。
+_LLM_CONFIG_PATH = Path(os.path.expanduser("~")) / ".tradingagents" / "llm_config.json"
+# 侧栏「个人 Claude 订阅覆盖」选项的取值；selectbox 的 widget 键是 subscription_scope_idx，
+# 恢复时必须写这个索引，只写派生值 subscription_scope 会在渲染时被覆盖回默认。
+_SCOPE_VALUES = ["off", "deep", "all"]
+
+# `MODEL_OPTIONS` 里每个供应商都带一条哨兵项 `("Custom model ID", "custom")`，含义是
+# "自己填模型 ID"。CLI 会就此追问输入（cli/utils.py::_select_model），Web 却把这个
+# 字符串**当成模型名直接发给 API**，于是用户拿到的是一句看不懂的服务端错误：
+#   The supported API model names are deepseek-flash, deepseek-v4-pro,
+#   but you passed custom.
+_CUSTOM_MODEL_SENTINEL = "custom"
+
+
+def _resolve_model_value(value: str, text_key: str, label: str) -> str:
+    """把下拉选中的模型值翻成真正要发给 API 的模型 ID。
+
+    选中哨兵项时渲染一个文本输入框、用它填的 ID——补上 CLI 已有的那一步。输入框复用
+    `custom_quick_model` / `custom_deep_model` 两个键，而这两个键本来就在配置持久化
+    清单里（`_save_llm_config` / `_load_saved_llm_config`），所以填过的 ID 会被记住。
+    """
+    if value != _CUSTOM_MODEL_SENTINEL:
+        return value
+    return st.text_input(
+        label,
+        key=text_key,
+        placeholder="填该供应商实际支持的模型 ID，例: deepseek-v4-pro",
+    ).strip()
+
+
+def validate_model_selection(config: dict | None = None) -> str | None:
+    """拦住「模型 ID 没填」，别让它变成服务端的一句 400。
+
+    模型配置在折叠面板里，选成「Custom model ID」却没填输入框时用户看不到任何提示，
+    请求会带着 'custom' 或空串打出去，报回来的是「你传了 custom」「你传了 .」这种与
+    界面完全对不上号的错误。
+
+    **必须同时挂在唯一的消费点**（web/app.py 拿到 start_analysis 之后、真正起线程之前）：
+    `start_analysis` 有 4 个生产者——侧栏「开始分析」、侧栏「未完成任务」续跑、
+    报告页「重新分析」、错误页「继续未完成任务」（历史记录只把它清空）——只在按钮里守一个，其余三条路径照样
+    把空模型发出去（实测踩过：深模型选「Custom model ID」且留空，走续跑路径，
+    收到 `but you passed .`）。
+
+    `config` 传入**真正要发出去的配置**时校验的就是最终值；不传则退回读 session_state，
+    供侧栏按钮做即时反馈。
+    """
+    source = config if config is not None else st.session_state
+    for label, key in (
+        ("快速思考模型", "quick_think_llm"),
+        ("深度思考模型", "deep_think_llm"),
+    ):
+        model = str(source.get(key) or "").strip()
+        if not model or model == _CUSTOM_MODEL_SENTINEL:
+            return (
+                f"{label}的模型 ID 没填。请在「⚙️ 模型配置」里选一个模型，"
+                "或选「Custom model ID」后填上该供应商实际支持的 ID。"
+            )
+    return None
+
+
+def _load_saved_llm_config() -> None:
+    """Restore user's last model selection into session_state defaults."""
+    try:
+        cfg = json.loads(_LLM_CONFIG_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    provider_key = cfg.get("llm_provider", "")
+    try:
+        idx = _PROVIDER_KEYS.index(provider_key)
+    except ValueError:
+        idx = 0
+    st.session_state.setdefault("llm_provider_idx", idx)
+    st.session_state.setdefault("quick_model_idx", cfg.get("quick_model_idx", 0))
+    st.session_state.setdefault("deep_model_idx", cfg.get("deep_model_idx", 0))
+    st.session_state.setdefault("llm_base_url", cfg.get("llm_base_url", ""))
+    scope = cfg.get("subscription_scope", "off")
+    st.session_state.setdefault("subscription_scope", scope)
+    st.session_state.setdefault(
+        "subscription_scope_idx", _SCOPE_VALUES.index(scope) if scope in _SCOPE_VALUES else 0
+    )
+    if cfg.get("agent_sdk_model"):
+        st.session_state.setdefault("agent_sdk_model", cfg["agent_sdk_model"])
+    for key in ("custom_quick_model", "custom_deep_model"):
+        if key in cfg and cfg[key]:
+            st.session_state.setdefault(key, cfg[key])
+
+
+def _save_llm_config() -> None:
+    """Persist current LLM config to disk (called before analysis)."""
+    cfg = {
+        "llm_provider": st.session_state.get("llm_provider", "minimax"),
+        "quick_model_idx": st.session_state.get("quick_model_idx", 0),
+        "deep_model_idx": st.session_state.get("deep_model_idx", 0),
+        "llm_base_url": st.session_state.get("llm_base_url", ""),
+        "subscription_scope": st.session_state.get("subscription_scope", "off"),
+    }
+    if st.session_state.get("agent_sdk_model"):
+        cfg["agent_sdk_model"] = st.session_state["agent_sdk_model"]
+    for key in ("custom_quick_model", "custom_deep_model"):
+        val = st.session_state.get(key)
+        if val:
+            cfg[key] = val
+    # 持久化失败（目录只读 / 磁盘满）只记 warning，不得打断「开始分析」主流程
+    try:
+        _LLM_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _LLM_CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    except OSError as exc:
+        logger.warning("LLM 配置持久化失败（不影响本次分析）: %s", exc)
+
 
 # Provider display names in recommended order
 _PROVIDERS: list[tuple[str, str]] = [
@@ -188,7 +307,9 @@ def _render_llm_config() -> None:
             help="用于常规分析任务，速度优先",
             on_change=lambda: set_pref("APP_QUICK_MODEL", quick_values[st.session_state["quick_model_idx"]]),
         )
-        st.session_state["quick_think_llm"] = quick_values[quick_idx]
+        st.session_state["quick_think_llm"] = _resolve_model_value(
+            quick_values[quick_idx], "custom_quick_model", "快速思考模型 ID"
+        )
 
         deep_idx = st.selectbox(
             "深度思考模型",
@@ -198,7 +319,9 @@ def _render_llm_config() -> None:
             help="用于辩论/决策等需要深度推理的任务",
             on_change=lambda: set_pref("APP_DEEP_MODEL", deep_values[st.session_state["deep_model_idx"]]),
         )
-        st.session_state["deep_think_llm"] = deep_values[deep_idx]
+        st.session_state["deep_think_llm"] = _resolve_model_value(
+            deep_values[deep_idx], "custom_deep_model", "深度思考模型 ID"
+        )
     else:
         custom_quick = st.text_input("快速思考模型 ID", key="custom_quick_model")
         custom_deep = st.text_input("深度思考模型 ID", key="custom_deep_model")
@@ -233,7 +356,6 @@ def _render_llm_config() -> None:
         "仅深度节点（Research/Portfolio）",
         "所有节点（含 7 个工具分析师）",
     ]
-    _scope_values = ["off", "deep", "all"]
     scope_idx = st.selectbox(
         "个人 Claude 订阅覆盖 (Agent SDK)",
         range(len(_scope_labels)),
@@ -245,7 +367,7 @@ def _render_llm_config() -> None:
             "需装 [agentsdk] 依赖，且本机 claude 已登录（或设 CLAUDE_CODE_OAUTH_TOKEN）。"
         ),
     )
-    scope = _scope_values[scope_idx]
+    scope = _SCOPE_VALUES[scope_idx]
     st.session_state["subscription_scope"] = scope
     if scope != "off":
         # 用别名而非写死版本号：claude CLI 的 opus/sonnet 恒指向最新模型。
@@ -295,6 +417,8 @@ def _render_llm_config() -> None:
 
 def render_sidebar() -> None:
     """Render the sidebar with input controls and history."""
+    # Restore saved LLM config on every render so selectboxes start at the user's last selection.
+    _load_saved_llm_config()
 
     st.markdown(
         """
@@ -351,8 +475,12 @@ def render_sidebar() -> None:
         disabled=is_busy or not ticker,
         type="primary",
     ):
+        _save_llm_config()  # persist model choice before running
+        model_err = validate_model_selection()
         resolved_code, err = _resolve_user_input(ticker)
-        if err:
+        if model_err:
+            st.error(f"❌ {model_err}")
+        elif err:
             st.error(f"❌ {err}")
         else:
             if resolved_code != ticker.strip():
