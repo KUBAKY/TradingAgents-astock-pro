@@ -516,6 +516,16 @@ pyproject.toml:
 
 ---
 
+## 数据层修复（2026-10-23）
+
+### 财报三表恢复取数（同源上游 #116 / #117）
+
+- **根因**：新浪财报接口返回 `data.report_list{报告期: {publish_date, update_time, data: [{item_title, item_value}]}}`，而 v0.2.5 去 akshare 时写的解析只认 `data.<fzb|lrb|llb>` 行列表 → 三个取数函数返回「No … data found」这样的正常字符串，不报错，基本面分析师把「该股没有财报」当事实写进报告（上游记录持续近 5 个月）。
+- **修复**：`a_stock._get_financial_report_sina` 兼容 `report_list`（同名科目按父级加前缀，如「财务费用-利息收入」，冲突再加 `item_field`），保留行列表兼容；补 `_sina_report_num`（回看越早取期数越多，20 期只覆盖最近 5 年）、`_report_deadline` 与公告日/入库时间判定，避免按「报告期 ≤ 分析日」筛提前看到尚未公布的财报。
+- **实测**：600519 资产负债表 44 字符 → **9,931 字符**；利润表 6,378；现金流量表 6,314。回看 `curr_date=2024-04-10` 时最新可见报告期为 2023-12-31，未提前露出 2024Q1。
+- **测试**：新增 `tests/test_sina_financial_report.py` 4 例（report_list 解析 / 未公布不可见 / 行列表兼容 / 同名科目不覆盖）；全量 **568 passed / 1 skipped / 45 subtests**。
+- **遗留**：本地仍是 0.4.0，上游 v0.5.21（2026-10-11）另有 20 个版本条目未合入，清单见知识库《开源生态-simonlin1212投研矩阵》。
+
 ## 视频内容映射(EP12 - EP16)
 
 | 集数 | 主题 | 对应里程碑 |
