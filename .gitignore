@@ -218,3 +218,6 @@ __marimo__/
 # Cache
 **/data_cache/
 .DS_Store
+
+# 回测数据仓（M1，体积大不入库）
+data/

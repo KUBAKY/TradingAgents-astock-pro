@@ -155,7 +155,7 @@ def compute_price_metrics(df: pd.DataFrame) -> dict[str, Any]:
 
 
 def detect_volume_price_patterns(df: pd.DataFrame) -> list[dict[str, Any]]:
-    """量价形态五信号（《投资分析体系》v1.1 量化阈值）。
+    """量价形态五信号（《投资分析体系》v1.3 量化阈值；AS-IMPL-02）。
 
     1. volume_breakout 放量突破: 量≥5日均量2倍 且收盘破20日平台高点
     2. shrink_pullback 缩量回调: 当日下跌 且量<5日均量50%（买入信号）
@@ -282,6 +282,7 @@ def scan_anomalies(metrics: dict, board: str, mcap_tier: str,
         out.append({"type": "breakdown", "signal": "创250日新低"})
 
     margin_pct = metrics.get("margin_to_float_mcap_pct")
+    # 规则 AS-IMPL-05：融资余额/流通市值 >15% 记杠杆过高（对应体系 7.5 风险预算）
     if margin_pct is not None and margin_pct > 15:
         out.append({"type": "margin_risk",
                     "signal": f"融资余额占流通市值 {margin_pct}% > 15%，杠杆过高风险线"})
@@ -306,6 +307,7 @@ def _is_retail_seat(name: str) -> bool:
 def detect_retail_takeover(seats: dict | None) -> list[dict]:
     """龙虎榜散户接盘信号：买方散户净买 > 卖方散户 且 卖方存在非散户席位（游资/机构离场）。
 
+    规则 AS-IMPL-04（对应体系 0.7：只作证据，不参与打分）。
     启发式：提示信号，不作硬黑名单。
     """
     if not seats:

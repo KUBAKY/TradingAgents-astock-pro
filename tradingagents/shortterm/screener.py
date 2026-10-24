@@ -114,7 +114,7 @@ def fetch_market_sentiment(trade_date: str | None = None) -> dict:
     - clist f3 升序跌幅榜 top100：跌停家数近似
     失败返回 sentiment=unknown，调用方降级为无温度计（不阻塞扫描）。
 
-    五档（《投资分析体系》v1.1 阈值 + 中档插值）：
+    五档（《投资分析体系》v1.3 阈值 + 中档插值；规则 AS-IMPL-03）：
     - 高潮: 涨停>100
     - 冰点: 涨停<20 且最高连板<3
     - 退潮: 涨停<20 但最高连板≥3（高度还在、家数萎缩），或跌停≥20 且涨停<40
@@ -175,7 +175,7 @@ def fetch_market_sentiment(trade_date: str | None = None) -> dict:
 def assign_tiers(candidates: list[dict]) -> list[dict]:
     """板块梯队五档标注（原地写 row["tier"]/row["tier_reason"]，返回同列表）。
 
-    规则（《A股投资分析体系》板块梯队）：
+    规则（《A股投资分析体系》v1.3 板块梯队；AS-IMPL-01）：
     - 龙头：板块内 activity 第一且连板≥1；板块无涨停时取 activity 第一
     - 龙二/龙三：龙头之后 activity 前二且连板≥1
     - 中位股：连板≥2 但不在板块 activity 前三（风险收益比差，容易 A 杀）
