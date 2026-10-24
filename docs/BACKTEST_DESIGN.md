@@ -274,7 +274,16 @@ for T in trading_calendar(start, end):
 
 **判定**：支持"环节选择对收益影响大"这一方向，但**不足以证明瓶颈框架有效**，模块维持实验性。要变成证据还缺三件事：① 按事前规则建篮子（当年年报主营构成/市值排名）；② 退市股入仓（当前仓只有现存 5,576 只）；③ 以"时点信号真实出现"为入场条件，而非全程持有。
 
+### M5 记录（2026-10-24）：前向纸面回测已接通
+
+- `analysis_registry` 新增 `kind=system`，窗口 10 个交易日，与 stock/follow/pick 共用评估器（`_eval_shortterm`）。
+- 登记入口：`scripts/register_system_analysis.py`，落盘 `~/.tradingagents/system_analysis/`，索引进同一 `index.json`。
+- 评级映射复用 `direction_from_rating`（买/观望/卖 ↔ Buy/Hold/Sell），不新造语义。
+- 自动验证沿用既有 launchd `com.tradingagents.validate`（工作日 15:35）。
+- 首条记录：`system:300308:2026-10-23`（观望 / 价值 / 55.6）。
+- 边界：前向验证不需要历史数据，可绕开幸存者偏差；但样本积累慢，需按范式累计 30 条以上再谈结论。
+
 ---
 
-**版本**：V1.0（设计稿，含 M1–M3 实施记录）
+**版本**：V1.0（设计稿，含 M1–M5 实施记录）
 **下一步**：M4 全市场评分卡（需先补历史成交额与退市股），或先做 M3 的无偏重测。

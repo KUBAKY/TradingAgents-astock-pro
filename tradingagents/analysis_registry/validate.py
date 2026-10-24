@@ -38,7 +38,7 @@ from .registry import (
 # 最短验证窗口（交易日）：stock/follow T+3 可判定；screen/pick/deep_review/mainline 等 T+10。
 _WINDOWS = {
     "stock": 3, "follow": 3, "screen": 10, "pick": 10,
-    "deep_review": 10, "mainline": 10,
+    "deep_review": 10, "mainline": 10, "system": 10,
 }
 
 _LOCK = threading.Lock()
@@ -229,7 +229,7 @@ def validate_record(rec: dict, asof: Optional[str] = None,
         kind = rec.get("kind")
         if kind == "screen":
             payload = _validate_screen(rec, asof)
-        elif kind in ("stock", "follow", "pick"):
+        elif kind in ("stock", "follow", "pick", "system"):
             payload = _payload_from_ev(rec, asof, _eval_shortterm(rec, asof, df))
         elif kind == "deep_review":
             payload = _payload_from_ev(rec, asof, _eval_deep_review(rec, asof, df))

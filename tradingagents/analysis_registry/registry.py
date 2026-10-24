@@ -37,7 +37,7 @@ _SHORTTERM_DIR_ENV = "TRADINGAGENTS_SHORTTERM_DIR"
 _LOGS_DIR_ENV = "TRADINGAGENTS_LOGS_DIR"
 _DEEPREVIEW_DIR_ENV = "TRADINGAGENTS_DEEPREVIEW_DIR"
 
-KINDS = ("stock", "follow", "screen", "pick", "deep_review", "mainline")
+KINDS = ("stock", "follow", "screen", "pick", "deep_review", "mainline", "system")
 
 _LOCK = threading.Lock()
 
@@ -378,7 +378,7 @@ def register(
         trade_date = str(trade_date or "").strip()
         if not trade_date or not path:
             return None
-        if kind in ("stock", "follow", "pick", "deep_review", "mainline") and not ticker:
+        if kind in ("stock", "follow", "pick", "deep_review", "mainline", "system") and not ticker:
             return None
         ts = int(ts if ts is not None else time.time())
         rid = record_id(kind, ticker, trade_date, ts)
