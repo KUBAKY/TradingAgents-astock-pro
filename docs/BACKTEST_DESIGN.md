@@ -109,7 +109,7 @@ CREATE TABLE theme_membership (
 
 ### 2.3 时点原则（PIT, point-in-time）
 
-1. 任何查询必须带 `asof`：`WHERE publish_date <= :trade_date`（财务）、`WHERE asof <= :trade_date`（主题归属）。
+1. 任何查询必须带 `asof`：`WHERE publish_date < :trade_date`（财务，同日公告次日可见）、`WHERE asof <= :trade_date`（主题归属）。
 2. 复权使用**当日已知**的因子；未来的除权不参与当日价格计算。
 3. 股票池用当日快照，**禁止用当前全量代码表回溯**。
 
