@@ -270,6 +270,17 @@ _TDX_CANARY_SYMBOL = "600519"
 _MOOTDX_RETRY_AFTER_S = 300.0
 _mootdx_unavailable_until = 0.0
 
+# 单台服务器的 socket 超时（秒）。mootdx 默认 15s，而坏服务器常常是「TCP 能连上、
+# 通达信协议不回包」——这种连接不会立刻抛错，只会静静等满超时。代理/防火墙环境里
+# 这类服务器占多数，逐台验证一圈会从十几秒放大到几分钟（实测一次取数卡 >35s 未返回）。
+# 4s 足够跑完握手 + 一根探针 K 线，又不会让整轮探测失去意义；可用 MOOTDX_TIMEOUT 覆盖。
+_MOOTDX_TIMEOUT = float(os.environ.get("MOOTDX_TIMEOUT", "4.0"))
+
+# 整轮服务器探测的总预算（秒）。单台超时只能保证「一台不会卡死」，但候选表有几十台，
+# 代理环境里「端口通、协议不回」的服务器可能占多数，逐台 4s + auto_retry 叠加仍能拖到
+# 几分钟。超过预算就不再逐台验证，交回给调用方按「暂不可用」处理（负缓存 300s 生效）。
+_MOOTDX_PROBE_BUDGET_S = float(os.environ.get("MOOTDX_PROBE_BUDGET", "20.0"))
+
 # ⚠️ 曾经加过「连续 N 台协议失败就停手」的提前退出，已移除：三台远端拒绝**证明不了**
 # 本地网络封了协议，而列表里靠后的服务器完全可能是好的。提前收手会让那台可用服务器
 # 永远试不到，还顺手记下 5 分钟负缓存。省下的十几秒不值得换这个风险——真正的耗时
@@ -422,13 +433,21 @@ def _get_mootdx_client():
         # 原顺序、逐台做真实取数验证，精选表依旧优先。
         reachable = _reachable_tdx_servers(_candidate_tdx_servers())
 
+        probe_deadline = time.time() + _MOOTDX_PROBE_BUDGET_S
         for ip, port in reachable:
+            if time.time() > probe_deadline:
+                logger.warning(
+                    "mootdx 服务器探测已用满 %.0fs 预算（%d 台待验），本轮放弃；"
+                    "可用 MOOTDX_PROBE_BUDGET 调大",
+                    _MOOTDX_PROBE_BUDGET_S, len(reachable),
+                )
+                break
             # 「TCP 通但通达信协议不通」有两种表现：factory 建连时握手就被拒，
             # 或者建出来了但取不到数。**两种都要算**——只统计后者的话，计数永远是 0
             # （实测这批服务器全是在 factory 里抛 ConnectionReset），下面的快速失败
             # 判断就失效了。
             try:
-                candidate = Quotes.factory(market="std", server=(ip, port))
+                candidate = Quotes.factory(market="std", server=(ip, port), timeout=_MOOTDX_TIMEOUT)
             except Exception as e:
                 tcp_ok_but_dead += 1
                 logger.debug("mootdx %s:%s 握手失败（%s），换下一台", ip, port, type(e).__name__)
@@ -447,7 +466,7 @@ def _get_mootdx_client():
     # `_candidate_tdx_servers()` 已经把 mootdx 自带的完整主机表逐台验证过了，
     # 覆盖面不比 bestip 差，而且每台都是"真取到数才算通过"。
     try:
-        candidate = Quotes.factory(market="std")
+        candidate = Quotes.factory(market="std", timeout=_MOOTDX_TIMEOUT)
     except Exception as e:
         logger.debug("mootdx 裸 factory 失败 — %s", e)
     else:

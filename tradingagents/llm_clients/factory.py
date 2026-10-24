@@ -37,7 +37,11 @@ def create_llm_client(
     Raises:
         ValueError: If provider is not supported
     """
-    provider_lower = provider.lower()
+    # strip 与 lower 一起做，且**这里是唯一的中央边界**：provider 来自用户手写的
+    # config / role_llms / 降级配置，`" DeepSeek "` 这种带空格的写法此前会一路走到
+    # 最后一行报 `Unsupported LLM provider`，而调用方（trading_graph）那几处判据都已
+    # strip 过 —— 两边不一致 = 韧性参数算对了、客户端却建不出来。
+    provider_lower = provider.strip().lower()
 
     if provider_lower in _OPENAI_COMPATIBLE:
         from .openai_client import OpenAIClient

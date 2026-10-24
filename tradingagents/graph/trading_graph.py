@@ -25,6 +25,12 @@ from tradingagents.agents.utils.agent_states import (
     RiskDebateState,
 )
 from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.missing_data import (
+    attach_missing_data_snapshot,
+    mark_resolved_tasks_consumed,
+    make_tool_call_recorder,
+    reset_missing_tasks_for_run,
+)
 
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
@@ -49,10 +55,31 @@ from tradingagents.agents.utils.agent_utils import (
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
-from .setup import GraphSetup
+from .setup import ROLE_KEYS, GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
+from ..llm_clients.factory import _OPENAI_COMPATIBLE
+
+# 七个分析师角色——它们受 `selected_analysts` 控制，没选中就不会进图。
+_ANALYST_ROLES = frozenset({
+    "market", "social", "news", "fundamentals", "policy", "hot_money", "lockup",
+})
+
+# 各家 provider 私有的参数：换了 provider 就不能带过去（别家可能直接拒收）。
+# ⚠️ 超时/重试**不在**这张表里——它们由 `_resilience_kwargs()` 按目标 provider
+#    重算（见那里的注释）。放进来会变成第二道判据，两道判据迟早对不上。
+_PROVIDER_SPECIFIC_KWARGS = frozenset({
+    "reasoning_effort",   # openai
+    "thinking_level",     # google
+    "effort",             # anthropic
+})
+
+# 超时与重试三件套：由 `_resilience_kwargs()` 统一产出，也由它统一覆盖。
+# 任何继承来的 llm_kwargs 在换目标 provider 时，这几个键都要先剔除再重算。
+_RESILIENCE_KWARGS = frozenset({
+    "timeout", "max_retries", "app_retries", "app_retry_delay",
+})
 
 
 def _normalize_yfinance_ticker(ticker: str) -> str:
@@ -127,6 +154,21 @@ def _is_unsupported_by_yfinance(symbol: str) -> bool:
     )
 
 
+def merge_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """用户传入的 config 是**覆盖项**，不是完整配置：缺的键一律取 DEFAULT_CONFIG。
+
+    README 快速开始的示例只给 4 个键（llm_provider / 两个模型 / output_language）。
+    此前这里是 ``config or DEFAULT_CONFIG`` —— 整体替换、不合并，紧接着
+    ``os.makedirs(config["data_cache_dir"])`` 就 KeyError，照 README 粘贴即崩（#101）。
+    dataflows 层的 set_config() 本来就是合并语义，这里与之对齐。
+    浅合并：嵌套字典（如 role_llms）按用户给的整份为准。
+    """
+    merged = DEFAULT_CONFIG.copy()
+    if config:
+        merged.update(config)
+    return merged
+
+
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
 
@@ -146,7 +188,7 @@ class TradingAgentsGraph:
             callbacks: Optional list of callback handlers (e.g., for tracking LLM/tool stats)
         """
         self.debug = debug
-        self.config = config or DEFAULT_CONFIG
+        self.config = merge_config(config)
         self.callbacks = callbacks or []
 
         # Update the interface's config
@@ -213,20 +255,43 @@ class TradingAgentsGraph:
                 # provider 做降级时不能把它带过去（例如把 anthropic 降级请求发到
                 # MiniMax 网关），否则同样是撞额度那一刻才炸。None ⇒ 该 provider
                 # 用自己的默认端点。
-                cross_provider = bool(_fb_provider) and _fb_provider != self.config["llm_provider"]
+                # provider 比较一律 strip+lower：配成 "DeepSeek" 时**同一家**会被判成
+                # 跨厂商，`backend_url` 就被扔掉，降级请求发去该 provider 的默认端点
+                # ——同样是撞额度那一刻才炸。
+                _fb_norm = str(_fb_provider or "").strip().lower()
+                _main_norm = str(self.config["llm_provider"] or "").strip().lower()
+                cross_provider = bool(_fb_norm) and _fb_norm != _main_norm
+                _fb_effective = _fb_norm or _main_norm
                 fallback_spec = {
-                    "provider": _fb_provider or self.config["llm_provider"],
+                    "provider": _fb_effective,
                     "model": _fb_model or self.config[fallback_model_key],
                     "base_url": None if cross_provider else self.config.get("backend_url"),
                     # 带上 callbacks：降级意味着**开始计费**，此时统计/成本回调
                     # 反而看不到这些调用的话，恰好在花钱的时候统计是瞎的。
                     **({"callbacks": self.callbacks} if self.callbacks else {}),
+                    # 用户显式配的输出上限也要带过去。否则撞额度降级之后，降级
+                    # provider 用它自己的默认上限，报告照样被截断——而这正是
+                    # 用户配 max_tokens 想避免的事（#91）。
+                    **({"max_tokens": self.config["max_tokens"]}
+                       if self.config.get("max_tokens") else {}),
+                    # 超时与应用层重试同样要带过去，理由和上面两条一样：降级是
+                    # **撞额度那一刻**才走到的路径，而降级目标往往就是一个 OpenAI
+                    # 兼容网关——正是 #100 那个"永不返回"的洞所在。漏带的话，这个
+                    # 挂死会恰好在最需要它工作的时候原样复现。
+                    # 判据按 `_fb_effective`（真正的目标）算，不是按 llm_provider。
+                    **self._resilience_kwargs(_fb_effective),
                 }
                 return create_llm_client(
                     provider="claude_agent_sdk",
                     model=self.config[sdk_model_key],
                     base_url=self.config.get("backend_url"),
                     fallback_spec=fallback_spec,
+                    # 订阅**主路径**自己也要超时。它不走 LangChain 客户端，所以
+                    # v0.5.19 给所有 provider 加的那份 timeout 一点都罩不到它——
+                    # 上面 fallback_spec 里那个只在**已经降级之后**才生效，
+                    # 而卡死恰恰发生在降级之前。判据按 "claude_agent_sdk" 自己算：
+                    # 它不是 OpenAI 兼容客户端，只该拿 timeout，不该拿应用层重试。
+                    **self._resilience_kwargs("claude_agent_sdk"),
                 )
             return create_llm_client(
                 provider=self.config["llm_provider"],
@@ -240,7 +305,12 @@ class TradingAgentsGraph:
 
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
-        
+
+        # 可选：给单个角色指定模型（#39）。不配 = 完全维持 quick/deep 两档的原行为。
+        self.role_llms = self._build_role_llms(
+            llm_kwargs, deep_on or quick_on, selected_analysts
+        )
+
         self.memory_log = TradingMemoryLog(self.config)
 
         # Create tool nodes
@@ -256,6 +326,7 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.tool_nodes,
             self.conditional_logic,
+            resolve_llm=self.role_llms.get,
         )
 
         self.propagator = Propagator()
@@ -272,10 +343,167 @@ class TradingAgentsGraph:
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
 
+    def _build_role_llms(
+        self,
+        llm_kwargs: Dict[str, Any],
+        subscription_on: bool,
+        selected_analysts=None,
+    ) -> Dict[str, Any]:
+        """按 `config["role_llms"]` 给单个角色单独建 LLM（#39）。
+
+        默认是空表 —— 不配任何角色时行为与以前完全一致（全部走 quick/deep 两档）。
+        配了才有意义：让多空辩手用不同厂商的模型，避免同源模型互相不反驳。
+
+        相同 (provider, model, endpoint) 的角色复用同一个实例，不会因为写了 7 个
+        角色就建 7 条连接。
+        """
+        specs = self.config.get("role_llms") or {}
+        if not specs:
+            return {}
+
+        unknown = sorted(set(specs) - set(ROLE_KEYS))
+        if unknown:
+            raise ValueError(
+                f"role_llms 里有无法识别的角色名：{unknown}。"
+                f"合法角色：{', '.join(ROLE_KEYS)}。"
+                f"（写错的角色名如果被静默忽略，你会以为配置生效了，实际没有。）"
+            )
+
+        # 没被选中的分析师不会进图，就别为它建模型：那会让一个**永远不执行**的节点
+        # 因为缺 API key 或缺可选依赖，把一次本来完全正常的分析在启动时就打断。
+        if selected_analysts is not None:
+            active = set(selected_analysts)
+            skipped = [r for r in specs if r in _ANALYST_ROLES and r not in active]
+            if skipped:
+                specs = {k: v for k, v in specs.items() if k not in skipped}
+                logger.info(
+                    "role_llms: 跳过未选中的分析师角色 %s（不建模型）",
+                    ", ".join(sorted(skipped)),
+                )
+            if not specs:
+                return {}
+
+        if subscription_on:
+            # 订阅覆盖是为了不产生 API 账单，这里显式点名哪些角色会绕开它去计费，
+            # 不能让人以为"全部走订阅"却在某几个角色上悄悄花钱。
+            logger.warning(
+                "role_llms 为以下角色单独指定了模型，它们会绕开 claude_agent_sdk "
+                "订阅覆盖、按 token 计费：%s", ", ".join(sorted(specs)),
+            )
+
+        main_provider = self.config["llm_provider"]
+        cache: Dict[tuple, Any] = {}
+        resolved: Dict[str, Any] = {}
+        for role, spec in specs.items():
+            if not isinstance(spec, dict) or not spec.get("model"):
+                raise ValueError(
+                    f"role_llms['{role}'] 必须是带 model 的字典，"
+                    f'例如 {{"provider": "deepseek", "model": "deepseek-chat"}}。'
+                )
+            provider = spec.get("provider") or main_provider
+            # role_llms 的 provider 是用户手写的自由字符串（README 通篇写作
+            # "DeepSeek"）。下面四处判据 —— base_url / 专属参数 / 韧性参数 / 缓存键
+            # —— 必须用**同一个**归一化结果，否则会出现"这处算同一家、那处算跨厂商"。
+            # 口径与 factory.create_llm_client 一致：strip().lower()。
+            provider_norm = provider.strip().lower()
+            main_norm = str(main_provider or "").strip().lower()
+            # backend_url 是给主 provider 配的端点。换了厂商还把它带过去，请求就会
+            # 发到另一家的网关（和 agent_sdk 降级那里同一个坑）。None = 用该
+            # provider 自己的默认端点。
+            if "backend_url" in spec:
+                base_url = spec["backend_url"]
+            elif provider_norm == main_norm:
+                base_url = self.config.get("backend_url")
+            else:
+                base_url = None
+
+            # 主 provider 的**专属**参数不能带给另一家：openai 的
+            # `reasoning_effort`、google 的 `thinking_level`、anthropic 的 `effort`
+            # 都是各家私有的，塞进 qwen / glm / 自建网关的请求体里可能直接被拒。
+            # 通用参数（max_tokens / callbacks 等）保留。
+            # `dict(...)` 是防御性的：下面要 pop 韧性键，同名分支直接复用引用就会
+            # 就地改掉调用方的 llm_kwargs。**当前观察不到后果**（主 quick/deep 两个
+            # 客户端已在本方法之前建好），所以没有测试钉它；留着是为了别人挪动建
+            # 客户端的顺序时不会踩到。
+            role_kwargs = (
+                dict(llm_kwargs) if provider_norm == main_norm
+                else {k: v for k, v in llm_kwargs.items()
+                      if k not in _PROVIDER_SPECIFIC_KWARGS}
+            )
+            # 超时/重试按**这个角色的** provider 重算，不沿用主 provider 的那份：
+            # 主 anthropic + bull=deepseek 时，deepseek 角色本该拿到应用层退避重试
+            # （它的 SDK 重试被我们置 0 了）；反方向则绝不能把 max_retries=0 套到
+            # anthropic 头上。两个方向都只有按目标算才对。
+            for key in _RESILIENCE_KWARGS:
+                role_kwargs.pop(key, None)
+            role_kwargs.update(self._resilience_kwargs(provider_norm))
+
+            key = (provider_norm, spec["model"], base_url, spec.get("api_key"))
+            if key not in cache:
+                client_kwargs = dict(role_kwargs)
+                if spec.get("api_key"):
+                    client_kwargs["api_key"] = spec["api_key"]
+                cache[key] = create_llm_client(
+                    provider=provider,
+                    model=spec["model"],
+                    base_url=base_url,
+                    **client_kwargs,
+                ).get_llm()
+            resolved[role] = cache[key]
+
+        logger.info(
+            "role_llms: %d 个角色单独配置，实际建了 %d 个模型实例",
+            len(resolved), len(cache),
+        )
+        return resolved
+
+    def _resilience_kwargs(self, target_provider: Any) -> Dict[str, Any]:
+        """超时与重试参数 —— 按**目标 provider** 算，而不是按 `llm_provider`。
+
+        这份 kwargs 有三个消费方（主客户端 / 订阅降级 fallback_spec / role_llms），
+        每一个都可能指向**不同的** provider，所以判据必须跟着目标走，不能当成
+        共享字典的一个属性（v0.5.19：三个调用点各自调本方法）。
+
+        · `timeout` —— **所有 provider 都给**。这不是 OpenAI 专属问题：
+          langchain 的三个封装层（ChatOpenAI / ChatAnthropic / AzureChatOpenAI）
+          在用户没给超时时都把 `None` **显式**传给底层 SDK，而 httpx 收到显式
+          `None` 的语义是"不设超时"，不是"用 SDK 默认值"。实测构造出来的对象：
+              不给 timeout → client.timeout=None（无限等）
+              给 timeout=150 → client.timeout=150.0
+          所以"另几家 SDK 本来就有 600 秒读超时"是假的 —— 那是**裸 SDK**
+          的常量，本项目一次都没走过裸 SDK。不给超时 = 给它们重开 #100 那个
+          "进程活着、零输出、永不返回"的洞。
+        · `max_retries=0` + `app_retries` / `app_retry_delay` —— **只给走
+          OpenAIClient 的 provider**。应用层退避重试只在 NormalizedChatOpenAI 里
+          实现；给别家注入 `max_retries=0` 等于静默关掉它们 SDK 自带的重试，
+          而 `app_retries` 它们根本不读。
+        """
+        provider = str(target_provider or "").strip().lower()
+        kwargs: Dict[str, Any] = {}
+
+        timeout = self.config.get("llm_timeout")
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+
+        if provider in _OPENAI_COMPATIBLE:
+            kwargs["max_retries"] = 0
+            kwargs["app_retries"] = self.config.get("llm_max_retries", 3)
+            kwargs["app_retry_delay"] = self.config.get("llm_retry_delay", 5)
+
+        return kwargs
+
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
         kwargs = {}
-        provider = self.config.get("llm_provider", "").lower()
+        provider = self.config.get("llm_provider", "").strip().lower()
+
+        # 与 provider 无关：单次回复的输出上限。撞上它就是报告写一半被截断（#91）。
+        max_tokens = self.config.get("max_tokens")
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
+
+        # 项目级 LLM 请求超时/重试（#300705 静默卡死兜底）。
+        kwargs.update(self._resilience_kwargs(provider))
 
         if provider == "google":
             thinking_level = self.config.get("google_thinking_level")
@@ -309,13 +537,19 @@ class TradingAgentsGraph:
                     get_stock_data,
                     # Technical indicators
                     get_indicators,
-                ]
+                ],
+                wrap_tool_call=make_tool_call_recorder("market"),
             ),
             "social": ToolNode(
                 [
-                    # News tools for social media analysis
+                    # 情绪分析不只读新闻：资金流是最硬的情绪证据，量价给强度，
+                    # 强势股榜给热度归因，新闻负责解释成因（#61）。
                     get_news,
-                ]
+                    get_fund_flow,
+                    get_hot_stocks,
+                    get_stock_data,
+                ],
+                wrap_tool_call=make_tool_call_recorder("social"),
             ),
             "news": ToolNode(
                 [
@@ -323,7 +557,8 @@ class TradingAgentsGraph:
                     get_news,
                     get_global_news,
                     get_insider_transactions,
-                ]
+                ],
+                wrap_tool_call=make_tool_call_recorder("news"),
             ),
             "fundamentals": ToolNode(
                 [
@@ -333,13 +568,15 @@ class TradingAgentsGraph:
                     get_income_statement,
                     get_profit_forecast,
                     get_industry_comparison,
-                ]
+                ],
+                wrap_tool_call=make_tool_call_recorder("fundamentals"),
             ),
             "policy": ToolNode(
                 [
                     get_news,
                     get_global_news,
-                ]
+                ],
+                wrap_tool_call=make_tool_call_recorder("policy"),
             ),
             "hot_money": ToolNode(
                 [
@@ -352,7 +589,8 @@ class TradingAgentsGraph:
                     get_fund_flow,
                     get_dragon_tiger_board,
                     get_industry_comparison,
-                ]
+                ],
+                wrap_tool_call=make_tool_call_recorder("hot_money"),
             ),
             "lockup": ToolNode(
                 [
@@ -360,7 +598,8 @@ class TradingAgentsGraph:
                     get_news,
                     get_fundamentals,
                     get_lockup_expiry,
-                ]
+                ],
+                wrap_tool_call=make_tool_call_recorder("lockup"),
             ),
         }
 
@@ -518,6 +757,7 @@ class TradingAgentsGraph:
 
         # Initialize state only for fresh runs. Passing a new initial state to
         # LangGraph would start a new run and replay completed nodes.
+        reset_missing_tasks_for_run(company_name, str(trade_date))
         past_context = self.memory_log.get_past_context(company_name)
         init_agent_state = self.propagator.create_initial_state(
             company_name, trade_date, past_context=past_context
@@ -526,10 +766,12 @@ class TradingAgentsGraph:
 
     def finalize_graph_run(self, company_name, trade_date, final_state):
         """Persist a completed run and clear its checkpoint."""
+        attach_missing_data_snapshot(final_state, company_name, str(trade_date))
         self.curr_state = final_state
 
         # Log state to disk.
         self._log_state(trade_date, final_state)
+        mark_resolved_tasks_consumed(company_name, str(trade_date))
 
         # Store decision for deferred reflection on the next same-ticker run.
         self.memory_log.store_decision(
@@ -587,6 +829,10 @@ class TradingAgentsGraph:
             "policy_report": final_state.get("policy_report", ""),
             "hot_money_report": final_state.get("hot_money_report", ""),
             "lockup_report": final_state.get("lockup_report", ""),
+            "missing_data_tasks": final_state.get("missing_data_tasks", []),
+            "missing_data_complete": final_state.get("missing_data_complete", True),
+            "missing_data_requires_reanalysis": final_state.get("missing_data_requires_reanalysis", False),
+            "missing_data_updated_at": final_state.get("missing_data_updated_at"),
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],

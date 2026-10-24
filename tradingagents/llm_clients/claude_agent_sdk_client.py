@@ -49,6 +49,11 @@ _MCP_SERVER_NAME = "astock_tools"
 _TOOL_MAX_TURNS = 30           # generous: an analyst may pull ~8 indicators + data
 _TOOL_RESULT_CAP = 60_000      # per-tool result char cap (safety, not normally hit)
 
+# 取消生效之后还要给 SDK 多少秒收尾（关子进程 / 跑 finally）。
+# 协程内部的 asyncio.wait_for 才是主机制，这个只兜底「SDK 连取消都不理」的情况
+# （配了 llm_timeout 时两条调用路径都会用上，见 _run_async）。
+_CANCEL_GRACE = 30
+
 try:  # optional dependency — see module docstring
     import claude_agent_sdk as _sdk
     from claude_agent_sdk import (
@@ -63,7 +68,21 @@ except Exception as exc:  # ImportError or any transitive import failure
     ClaudeAgentOptions = None
     create_sdk_mcp_server = None
     _sdk_tool = None
-    ClaudeSDKError = Exception  # placeholder so `except` clauses never NameError
+
+    class _MissingSDKError(Exception):
+        """SDK 未安装时 ClaudeSDKError 的占位类型。
+
+        ⚠️ 这里**不能**用 `Exception` 本身占位。`ClaudeSDKError` 会进
+        `_FALLBACK_ERRORS`，而那个元组决定"哪些错误可以降级到按 token 计费的
+        provider"。一旦它退化成 `Exception`，`isinstance(任何异常, ...)` 恒为真，
+        `_AuthError`（订阅凭据失效，刻意排除在外）也会被判成可降级——这条护栏
+        存在的全部意义就是不让凭据过期变成悄悄开始计费。
+
+        用独立类型占位后，`except ClaudeSDKError` 一样不会 NameError，而元组永远
+        不会变成 catch-all。保护这条护栏的测试也就不再依赖可选依赖是否安装。
+        """
+
+    ClaudeSDKError = _MissingSDKError
     _IMPORT_ERROR = exc
 
 
@@ -137,6 +156,15 @@ class _SDKResultError(Exception):
     """Raised when the Agent SDK returns an error ResultMessage — triggers fallback."""
 
 
+class _SDKTimeout(Exception):
+    """订阅调用超过 `llm_timeout` 换算出的预算仍未返回 — triggers fallback.
+
+    订阅主路径**不走 LangChain 客户端**，所以 v0.5.19 给所有 provider 加的
+    `timeout` 一点都罩不到它：Agent SDK 拉起 `claude` 子进程后卡住，`async for`
+    就一直悬着——进程活着、零输出、永不返回（#100 那个洞在订阅路径上的翻版）。
+    """
+
+
 # Errors that mean "the subscription path could not serve this call" → fall back.
 class _AuthError(Exception):
     """订阅凭据失效（OAuth token 过期 / 未登录）。
@@ -149,7 +177,9 @@ class _AuthError(Exception):
 
 
 # 认证失败**不在**此列表：只有限流/SDK 故障才降级到付费 provider。
-_FALLBACK_ERRORS = (ClaudeSDKError, _RateLimitHit, _SDKResultError)
+# 超时**在**列表里：它和 _SDKResultError 一样是「订阅这条路没能把这次调用服务掉」，
+# 而另一个选项是永远卡住——卡住比降级更糟，且 fallback_spec 为空时照样往外抛。
+_FALLBACK_ERRORS = (ClaudeSDKError, _RateLimitHit, _SDKResultError, _SDKTimeout)
 
 
 # --------------------------------------------------------------------------- #
@@ -215,18 +245,28 @@ def _extract_json(text: str) -> str:
     return match.group(0)
 
 
-def _run_async(coro):
+def _run_async(coro, join_timeout: Optional[float] = None):
     """Run an async coroutine to completion from a synchronous caller.
 
     ``trading_graph`` drives LangGraph synchronously, so normally there is no
-    running loop and ``asyncio.run`` works. If a loop is already running, run
-    the coroutine on a dedicated thread with its own loop so we never disturb
-    the caller's loop.
+    running loop; if a loop is already running we must not disturb it. Either
+    way the coroutine gets its own loop on a dedicated thread whenever a
+    ``join_timeout`` is configured.
+
+    ``join_timeout`` **不是**主超时机制——主机制是协程内部的
+    ``asyncio.wait_for``（见 ``_run_query``）。这里兜底「SDK 连 CancelledError
+    都不理」的情况：SDK 若阻塞住自己的事件循环、或取消后的 ``aclose`` 永久挂起，
+    ``wait_for`` 根本没机会跑，调用方就被永久挂住。所以**只要配了
+    ``join_timeout`` 就一律走工作线程 + 有界 join**，不区分调用方有没有事件
+    循环——直接 ``asyncio.run`` 那条路没有任何办法把控制权拿回来。
+    ``None`` ⇒ 无限等（没配 ``llm_timeout`` 时的原行为）：此时没有运行中的循环
+    就退回直接 ``asyncio.run``，少起一个线程。
     """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
+    if join_timeout is None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
 
     box: dict[str, Any] = {}
 
@@ -236,12 +276,45 @@ def _run_async(coro):
         except BaseException as exc:  # propagate to the calling thread, don't swallow
             box["error"] = exc
 
-    thread = threading.Thread(target=_worker)
+    # daemon=True：放弃等待之后这个线程还在跑，非 daemon 会连 Python 进程都退不掉
+    # ——把「一次调用挂死」升级成「整个进程永远关不掉」。
+    thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
-    thread.join()
+    thread.join(join_timeout)
+    if thread.is_alive():
+        raise _SDKTimeout(
+            f"Claude Agent SDK 工作线程超过 {join_timeout:g} 秒仍未退出"
+            "（取消信号未生效），已放弃等待该线程。"
+        )
     if "error" in box:
         raise box["error"]
     return box["value"]
+
+
+def _positive_timeout(value: Any) -> Optional[float]:
+    """把配置里的 ``llm_timeout`` 归一成正的秒数。
+
+    ``None`` / 0 / 负数 / 解析不了的值 ⇒ ``None``（不设超时，即本改动前的原行为）。
+    0 和负数必须落到"不设超时"而不是"立刻超时"：``asyncio.wait_for(coro, -1)``
+    会当场抛超时，等于把一个手滑的配置变成"这个 provider 一次都跑不通"。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        # bool 是 int 的子类，float(True) == 1.0：把一个开关误配悄悄变成"1 秒超时"，
+        # 等于这个 provider 一次都跑不通。布尔值不是秒数，当作没配。
+        logger.warning(
+            "claude_agent_sdk: llm_timeout=%r 是布尔值而非秒数，本次调用不设超时", value
+        )
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "claude_agent_sdk: 无法解析的 llm_timeout=%r，本次调用不设超时", value
+        )
+        return None
+    return seconds if seconds > 0 else None
 
 
 def _sdk_tools_from_langchain(lc_tools):
@@ -391,9 +464,13 @@ class ClaudeAgentSDKClient(BaseLLMClient):
     """
 
     def __init__(self, model: str, base_url: Optional[str] = None,
-                 fallback_spec: Optional[dict] = None, **kwargs):
+                 fallback_spec: Optional[dict] = None,
+                 timeout: Optional[float] = None, **kwargs):
         super().__init__(model, base_url, **kwargs)
         self.fallback_spec = fallback_spec
+        # `llm_timeout` 由 trading_graph._resilience_kwargs() 注入，和其它 provider
+        # 同一个配置项——订阅主路径不走 LangChain，所以必须在这里自己实现。
+        self.timeout = _positive_timeout(timeout)
 
     def get_llm(self) -> AgentSDKChatModel:
         if _sdk is None:
@@ -464,52 +541,113 @@ class ClaudeAgentSDKClient(BaseLLMClient):
             opts["output_format"] = output_format
         return ClaudeAgentOptions(**opts)
 
+    def _timeout_for(self, max_turns: int) -> Optional[float]:
+        """把 `llm_timeout` 换算成**这一次调用**的整段预算（秒）。
+
+        `llm_timeout` 在别的 provider 那里是**一次模型请求**的超时：分析师的
+        ReAct 循环由 LangGraph 在外面驱动，每轮都是一次新的 HTTP 请求、各拿一份
+        完整预算。Agent SDK 反过来，把整个工具循环跑在**同一次** `.invoke()` 里，
+        最多 `max_turns` 次模型调用，所以整段预算按轮数放大，单位含义才对得上。
+        单轮调用（deep / structured 节点，`max_turns=1`）拿到的就是 llm_timeout 本身。
+
+        ⚠️ 别改成"整段固定 llm_timeout"：150 秒套到 30 轮的分析师工具循环上，
+        几乎每次都会超时并降级到按 token 计费的 provider——正是启用订阅要避免的事，
+        也正是 _AuthError 那条护栏在防的"悄悄开始计费"。
+        """
+        if self.timeout is None:
+            return None
+        return self.timeout * max(1, int(max_turns))
+
+    def _run_query(self, prompt: str, options, budget: Optional[float], **query_kwargs):
+        """在 `budget` 秒的墙钟预算内跑完一次 SDK 调用（含内部工具循环）。
+
+        两层，缺一不可：
+        ① `asyncio.wait_for` 取消查询协程 —— `async for` 就地抬出 CancelledError，
+           `_query` 的 finally 关掉 SDK 异步生成器（连同它拉起的 `claude` 子进程）。
+        ② `_run_async(join_timeout=...)` 把查询放进 daemon 工作线程并有界 join，
+           防 SDK 忽略取消（含阻塞事件循环、aclose 挂死）。配了预算时这层在
+           "调用方有没有事件循环"两种情形下都生效（见该函数注释）。
+        `budget is None`（没配 llm_timeout）时两层都不启用，行为与本改动前一致。
+        """
+        async def _guarded():
+            coro = self._query(prompt, options, **query_kwargs)
+            if budget is None:
+                return await coro
+            try:
+                return await asyncio.wait_for(coro, budget)
+            except asyncio.TimeoutError as exc:
+                raise _SDKTimeout(
+                    f"Claude Agent SDK 调用超过 {budget:g} 秒未返回，已中止。"
+                    f"该预算 = llm_timeout({self.timeout:g}s) × 本次允许的模型轮数。"
+                    "深度推理或工具循环经常触发就调大 llm_timeout。"
+                ) from exc
+
+        return _run_async(
+            _guarded(),
+            join_timeout=None if budget is None else budget + _CANCEL_GRACE,
+        )
+
     async def _query(self, prompt: str, options, prefer_result: bool = False):
         text_parts: list[str] = []
         result_msg = None
         auth_hint: Optional[str] = None
-        async for message in _sdk.query(prompt=prompt, options=options):
-            if isinstance(message, _sdk.RateLimitEvent):
-                # RateLimitEvent fires on ANY status change, including
-                # "allowed_warning" (near the limit but STILL SERVING) and
-                # "allowed" (recovered). Only status=="rejected" means THIS call
-                # was actually blocked. Raising on anything else discards a
-                # successful subscription response and silently falls back to
-                # the paid provider — the opposite of this feature's purpose.
-                #
-                # In particular, DO NOT key off overage_status: it is a separate
-                # axis describing whether *overage* (paid usage beyond the plan)
-                # is available. When an org disables overage it reports
-                # overage_status="rejected"/"org_level_disabled" on EVERY event,
-                # including status=="allowed" ones the plan served within
-                # allowance — so keying fallback off it downgraded 100% of
-                # subscription calls to the paid fallback. (regression:
-                # test_query_allowed_with_overage_rejected_does_not_fall_back)
-                info = getattr(message, "rate_limit_info", None)
-                if getattr(info, "status", None) == "rejected":
-                    raise _RateLimitHit(str(info))
-                logger.warning(
-                    "claude_agent_sdk: rate-limit status=%s (still serving); continuing",
-                    getattr(info, "status", None),
-                )
-                continue
-            # 认证失败在 SDK 里会被翻译成 "error result: success" 这种毫无信息量的
-            # 报错（实测 2026-07-31：OAuth token 过期时 ResultMessage.subtype 仍是
-            # "success"、is_error=True，真正的原因只出现在 api_retry 事件和助手文本里）。
-            # 在这里正向识别，给出可执行的修复指引。
-            if _looks_like_auth_failure(message):
-                # 先跳出再抛：在 async for 内部抛异常会让 SDK 的异步生成器
-                # 处于运行中被关闭的状态，附带一条 "aclose(): asynchronous
-                # generator is already running" 噪音，掩盖真正的原因。
-                auth_hint = _auth_failure_hint(message)
-                break
+        stream = _sdk.query(prompt=prompt, options=options)
+        try:
+            async for message in stream:
+                if isinstance(message, _sdk.RateLimitEvent):
+                    # RateLimitEvent fires on ANY status change, including
+                    # "allowed_warning" (near the limit but STILL SERVING) and
+                    # "allowed" (recovered). Only status=="rejected" means THIS call
+                    # was actually blocked. Raising on anything else discards a
+                    # successful subscription response and silently falls back to
+                    # the paid provider — the opposite of this feature's purpose.
+                    #
+                    # In particular, DO NOT key off overage_status: it is a separate
+                    # axis describing whether *overage* (paid usage beyond the plan)
+                    # is available. When an org disables overage it reports
+                    # overage_status="rejected"/"org_level_disabled" on EVERY event,
+                    # including status=="allowed" ones the plan served within
+                    # allowance — so keying fallback off it downgraded 100% of
+                    # subscription calls to the paid fallback. (regression:
+                    # test_query_allowed_with_overage_rejected_does_not_fall_back)
+                    info = getattr(message, "rate_limit_info", None)
+                    if getattr(info, "status", None) == "rejected":
+                        raise _RateLimitHit(str(info))
+                    logger.warning(
+                        "claude_agent_sdk: rate-limit status=%s (still serving); continuing",
+                        getattr(info, "status", None),
+                    )
+                    continue
+                # 认证失败在 SDK 里会被翻译成 "error result: success" 这种毫无信息量的
+                # 报错（实测 2026-07-31：OAuth token 过期时 ResultMessage.subtype 仍是
+                # "success"、is_error=True，真正的原因只出现在 api_retry 事件和助手文本里）。
+                # 在这里正向识别，给出可执行的修复指引。
+                if _looks_like_auth_failure(message):
+                    # 先跳出再抛：在 async for 内部抛异常会让 SDK 的异步生成器
+                    # 处于运行中被关闭的状态，附带一条 "aclose(): asynchronous
+                    # generator is already running" 噪音，掩盖真正的原因。
+                    auth_hint = _auth_failure_hint(message)
+                    break
 
-            if isinstance(message, _sdk.AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, _sdk.TextBlock):
-                        text_parts.append(block.text)
-            elif isinstance(message, _sdk.ResultMessage):
-                result_msg = message
+                if isinstance(message, _sdk.AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, _sdk.TextBlock):
+                            text_parts.append(block.text)
+                elif isinstance(message, _sdk.ResultMessage):
+                    result_msg = message
+        finally:
+            # 显式收尾 SDK 的异步生成器（以及它拉起的 `claude` 子进程）：
+            # ① 超时取消时 `async for` 在 __anext__ 上抬出 CancelledError；
+            # ② 认证失败是 break 出来的，生成器停在 yield 上还活着。
+            # 两种都只会等到事件循环 shutdown_asyncgens 才释放，而线程分支上
+            # 那个循环可能已经被我们放弃了——那就真成了泄漏。
+            # 此处生成器一定不在运行中，不会触发 "already running" 那条噪音。
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except (Exception, asyncio.CancelledError):  # 收尾失败不掩盖真实原因
+                    logger.debug("claude_agent_sdk: 关闭查询生成器失败", exc_info=True)
 
         if auth_hint:
             raise _AuthError(auth_hint)
@@ -542,7 +680,7 @@ class ClaudeAgentSDKClient(BaseLLMClient):
     def _invoke_raw(self, prompt: Any) -> AIMessage:
         system_prompt, user_text = _split_prompt(prompt)
         options = self._build_options(system_prompt)
-        text, _ = _run_async(self._query(user_text, options))
+        text, _ = self._run_query(user_text, options, self._timeout_for(1))
         return AIMessage(content=text)
 
     def _invoke_with_tools(self, lc_tools, prompt: Any) -> AIMessage:
@@ -554,13 +692,17 @@ class ClaudeAgentSDKClient(BaseLLMClient):
         options = self._build_options(
             system_prompt, sdk_tools=sdk_tools, tool_names=tool_names
         )
-        text, _ = _run_async(self._query(user_text, options, prefer_result=True))
+        # 工具循环的预算按 `max_turns` 放大 —— 与 `_build_options` 里设的轮数上限
+        # 是**同一个** `_TOOL_MAX_TURNS`，改一处两处一起动。
+        text, _ = self._run_query(
+            user_text, options, self._timeout_for(_TOOL_MAX_TURNS), prefer_result=True
+        )
         return AIMessage(content=text)
 
     def _invoke_structured(self, schema, prompt: Any):
         system_prompt, user_text = _split_prompt(prompt)
         output_format = {"type": "json_schema", "schema": schema.model_json_schema()}
         options = self._build_options(system_prompt, output_format=output_format)
-        text, structured = _run_async(self._query(user_text, options))
+        text, structured = self._run_query(user_text, options, self._timeout_for(1))
         data = structured if structured is not None else json.loads(_extract_json(text))
         return schema.model_validate(data)

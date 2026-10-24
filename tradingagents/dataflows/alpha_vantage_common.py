@@ -7,6 +7,13 @@ from io import StringIO
 
 API_BASE_URL = "https://www.alphavantage.co/query"
 
+# 本模块所有出站请求的超时（秒）。
+# ⚠️ `requests.get` 不给 timeout 的语义是**永远等下去**——网关挂起时整轮分析
+# 进程活着、零输出、永不返回，和 #100 那个 LLM 挂死是同一类静默失败。
+# 比仓内其它数据源（a_stock.py 用 10~15 秒）给得宽一档：Alpha Vantage 在境外，
+# 且 `outputsize=full` 的全历史 CSV 是这里最大的一次响应。
+REQUEST_TIMEOUT = 30
+
 def get_api_key() -> str:
     """Retrieve the API key for Alpha Vantage from environment variables."""
     api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
@@ -63,7 +70,7 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
         # Remove entitlement if it's None or empty
         api_params.pop("entitlement", None)
     
-    response = requests.get(API_BASE_URL, params=api_params)
+    response = requests.get(API_BASE_URL, params=api_params, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
 
     response_text = response.text
