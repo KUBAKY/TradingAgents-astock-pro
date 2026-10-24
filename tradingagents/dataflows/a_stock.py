@@ -15,9 +15,11 @@ Data sources:
 from __future__ import annotations
 
 from typing import Annotated
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 import io
 from dateutil.relativedelta import relativedelta
+import contextlib
+import io
 import json as _json
 import os
 import logging
@@ -60,10 +62,42 @@ def _get_prefix(code: str) -> str:
     return "sz"
 
 
+def _reject_non_a_share(original: str, code: str) -> None:
+    """港股/美股代码走到 A 股数据层时当场报错，而不是拿去查 A 股（#43）。
+
+    A 股代码恒为 6 位数字。港股是 4~5 位（`00700`）或带 `.HK` 后缀，美股是字母。
+    这些代码此前会被**原样放行**，然后拿去问 mootdx / 腾讯 / 东财——而这些源对
+    不存在的代码往往不报错，只返回空值或僵尸报价（北交所 920 号段就踩过，见
+    `_normalize_ticker` 上游的 `_get_prefix`）。于是模型会拿着一份看起来正常、
+    实际属于别的市场或根本不存在的数据写完整篇报告，报告里完全看不出来。
+    """
+    if code.isdigit() and len(code) == 6:
+        return
+    upper = original.strip().upper()
+    if upper.endswith(".HK") or (code.isdigit() and len(code) in (4, 5)):
+        raise ValueError(
+            f"'{original}' 是港股代码。本数据层只支持 A 股（6 位数字代码，"
+            f"如 600519 / 000001）。港股数据请用姊妹项目 global-stock-data，"
+            f"多 Agent 港股分析仍在 roadmap（issue #43）。"
+        )
+    if code and not code.isdigit():
+        raise ValueError(
+            f"'{original}' 不是 A 股代码。本数据层只支持 A 股 6 位数字代码"
+            f"（如 600519）；美股/港股请用姊妹项目 global-stock-data。"
+        )
+    raise ValueError(
+        f"'{original}' 不是有效的 A 股代码：A 股代码恒为 6 位数字（如 600519），"
+        f"这里解析出的是 '{code}'。"
+    )
+
+
 def _normalize_ticker(symbol: str) -> str:
     """Strip exchange prefix/suffix, return pure 6-digit code.
 
     Handles: '688017', 'SH688017', '688017.SH', 'sh688017'
+
+    非 A 股代码（港股 `00700` / `0700.HK`、美股 `AAPL`）会直接报错，不再原样
+    放行去查 A 股数据源（#43）。
     """
     s = symbol.strip().upper()
     # Remove .SH / .SZ / .BJ suffix
@@ -76,7 +110,9 @@ def _normalize_ticker(symbol: str) -> str:
         if s.startswith(prefix):
             s = s[len(prefix) :]
             break
-    return safe_ticker_component(s)
+    code = safe_ticker_component(s)
+    _reject_non_a_share(symbol, code)
+    return code
 
 
 # ---------------------------------------------------------------------------
@@ -93,15 +129,18 @@ def _build_name_code_map() -> tuple[dict[str, str], dict[str, str]]:
     if _name_to_code is not None:
         return _name_to_code, _code_to_name
 
-    client = _get_mootdx_client()
     n2c: dict[str, str] = {}
     c2n: dict[str, str] = {}
 
     try:
-        with _MOOTDX_LOCK:
-            for market in (0, 1):  # 0=SZ, 1=SH
-                stocks = client.stocks(market=market)
-                if stocks is None or stocks.empty:
+        for market in (0, 1):  # 0=SZ, 1=SH
+            stocks = _mootdx_call("stocks", market=market)
+            if stocks is None or stocks.empty:
+                continue
+            for _, row in stocks.iterrows():
+                code = str(row["code"]).strip()
+                name = str(row["name"]).strip()
+                if not _re.match(r"^[036]\d{5}$", code):
                     continue
                 for _, row in stocks.iterrows():
                     code = str(row["code"]).strip()
@@ -163,6 +202,50 @@ def resolve_ticker(user_input: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 未来函数防护（point-in-time）
+# ---------------------------------------------------------------------------
+
+
+# A 股市场时区。判"今天"必须按市场所在地算，不能用主机本地时区——
+# 主机在 UTC+9 以东（如新西兰 UTC+13）时，当地已过零点而上海还在前一天，
+# 当天的分析会被判成"复盘历史"：实时资金流被略去、快照工具打出莫须有的未来函数
+# 警告。反过来主机在西半球也会把已经过去的交易日当成"今天"。
+_MARKET_TZ = timezone(timedelta(hours=8))
+
+
+def _market_today() -> "date":
+    """A 股市场当前日期（Asia/Shanghai），与主机时区无关。"""
+    return datetime.now(_MARKET_TZ).date()
+
+
+def _is_historical(curr_date) -> bool:
+    """分析日期是否早于市场当天。早于 = 这次是在复盘历史，不能拿实时数据当事实。"""
+    if not curr_date:
+        return False
+    try:
+        return (
+            datetime.strptime(str(curr_date)[:10], "%Y-%m-%d").date()
+            < _market_today()
+        )
+    except ValueError:
+        return False
+
+
+def _snapshot_notice(curr_date: str, what: str) -> str:
+    """实时快照被用在历史日期上时，在正文顶部明说。
+
+    有些数据源只提供"此刻"的值（腾讯实时行情、同花顺当前一致预期），拿不到
+    某个历史日的原值。既然补不上，就必须**说出来**——否则模型会把今天的估值
+    当成分析日当天的事实写进报告，而这种污染在报告里完全看不出来。
+    """
+    return (
+        f"⚠️ 未来函数警告：以下{what}是**此刻的实时快照**，不是 {curr_date} 当天的值。"
+        f"本数据源不提供历史时点数据。在复盘历史日期时，**不得**把这些数字当作"
+        f"{curr_date} 当天已知的事实，也不要据此推断当时的判断。\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # mootdx client (singleton)
 # ---------------------------------------------------------------------------
 
@@ -178,8 +261,65 @@ _TDX_SERVERS = [
 ]
 
 
+# 探测用的探针股票：主板老票，任何通达信服务器都应能返回它的日线。
+_TDX_CANARY_SYMBOL = "600519"
+
+# 全部服务器都验不过之后，隔多久才允许再探一轮（秒）。没有这个负缓存，
+# 每一次取数都会把整张服务器表重探一遍（10 台 × TCP 超时），把"取不到数"
+# 放大成"每个请求卡几十秒"。
+_MOOTDX_RETRY_AFTER_S = 300.0
+_mootdx_unavailable_until = 0.0
+
+# ⚠️ 曾经加过「连续 N 台协议失败就停手」的提前退出，已移除：三台远端拒绝**证明不了**
+# 本地网络封了协议，而列表里靠后的服务器完全可能是好的。提前收手会让那台可用服务器
+# 永远试不到，还顺手记下 5 分钟负缓存。省下的十几秒不值得换这个风险——真正的耗时
+# 大头是 bestip 全表测速，那个已经单独规避了。
+
+
+def _candidate_tdx_servers() -> list[tuple[str, int]]:
+    """待试的通达信服务器：先用实测精选的 `_TDX_SERVERS`，再补 mootdx 自带的完整主机表。
+
+    只试精选的那 10 台是不够的——它们要是恰好都不可用，而 mootdx 自带表里还有活着的
+    主机，就会被判成"全网不可达"并记 5 分钟负缓存。这里把两张表合起来去重后逐台验证，
+    覆盖面等同 `bestip`，但不做它那套要跑几分钟的全表测速。
+    """
+    servers = list(_TDX_SERVERS)
+    seen = set(servers)
+    try:
+        from mootdx.consts import HQ_HOSTS
+        for entry in HQ_HOSTS:
+            # 形如 ("深圳双线主站1", "110.41.147.114", 7709)
+            host = (entry[1], entry[2]) if len(entry) >= 3 else None
+            if host and host not in seen:
+                seen.add(host)
+                servers.append(host)
+    except Exception as e:  # mootdx 版本变动导致取不到就只用精选表，不影响主流程
+        logger.debug("读取 mootdx HQ_HOSTS 失败，仅使用内置精选表：%s", e)
+    return servers
+
+
+def _reachable_tdx_servers(servers, timeout: float = 2.0):
+    """并发做 TCP 预筛，返回可连的那些（保持原顺序）。
+
+    只是把"等超时"这件事并行化，不改变优先级：返回顺序仍是候选表顺序，所以实测
+    精选的服务器依旧排在前面、依旧第一个被真实验证。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not servers:
+        return []
+    with ThreadPoolExecutor(max_workers=min(16, len(servers))) as pool:
+        flags = list(pool.map(lambda s: _probe_tdx(s[0], s[1], timeout), servers))
+    return [srv for srv, ok in zip(servers, flags) if ok]
+
+
 def _probe_tdx(ip: str, port: int, timeout: float = 2.0) -> bool:
-    """TCP 握手探测通达信服务器是否可达。"""
+    """TCP 握手探测通达信服务器端口是否开着。
+
+    ⚠️ 只是**廉价预筛**，通过不代表能取到数：实测存在大量"TCP 三次握手成功、
+    通达信协议握手立刻被 RST"的服务器。选服务器必须再走 `_tdx_client_works()`
+    做一次真实取数验证（#90）。
+    """
     try:
         with socket.create_connection((ip, port), timeout=timeout):
             return True
@@ -187,36 +327,165 @@ def _probe_tdx(ip: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
+def _tdx_client_works(client) -> bool:
+    """真实拉一根 K 线来验证这个 client 确实能取数。"""
+    try:
+        df = client.bars(symbol=_TDX_CANARY_SYMBOL, category=4, offset=1)
+        return df is not None and not df.empty
+    except Exception:
+        return False
+
+
+def reset_mootdx_client() -> None:
+    """丢弃缓存的 client，让下一次调用重新选服务器。
+
+    单例一旦钉在一台"当时能用、后来挂了"的服务器上，之后每次取数都失败降级且
+    永远不会重选。数据调用发现 mootdx 出错时调它，下一次就能换一台（#90）。
+    """
+    global _mootdx_client, _mootdx_unavailable_until
+    _mootdx_client = None
+    _mootdx_unavailable_until = 0.0
+
+
+@contextlib.contextmanager
+def _preserve_mootdx_bestip():
+    """探测期间保护 mootdx 的持久化服务器配置，退出时按需还原。
+
+    `StdQuotes.__init__` 里有 `config.set('BESTIP', {'HQ': self.server})`——**每建一次
+    带 server 的 client 都会写进 mootdx 的配置文件**。逐台探测 38 个候选就等于把用户
+    原本配好的服务器一路覆写，最后留下的是最后一台**失败的**服务器，还会连累同一台
+    机器上其它用 mootdx 的程序。
+
+    🔴 必须先 `setup()` 再快照：新进程里 `config.get("BESTIP")` 返回的是模块默认空值，
+    用户持久化的值要等 `BaseQuotes.__init__` 调 `setup()` 才读进来。快照到空值的话，
+    "还原"反而会把真实配置抹成空——比不还原更糟。
+    实测（mootdx 0.11.7）：setup 前 `{'HQ': ''}`，setup 后 `{'HQ': ['218.6.x.x', 7709]}`。
+
+    用法：`with _preserve_mootdx_bestip() as keep:` —— 选出可用服务器时调 `keep()`
+    表示"这次的覆写是我们想要的，别还原"；不调就在退出时还原。
+
+    ⚠️ **做成上下文管理器而不是手动调还原函数**：此前是在两处分别调 `_restore_bestip()`，
+    再加一条提前返回就会漏掉一处，而漏掉的后果是静默留下一台死服务器。
+    """
+    saved = None
+    try:
+        from mootdx import config as _cfg
+        _cfg.setup()
+        saved = _cfg.get("BESTIP")
+        if isinstance(saved, dict):
+            saved = dict(saved)
+    except Exception as e:  # 版本差异导致取不到就跳过保护，别影响主流程
+        logger.debug("读取 mootdx BESTIP 失败，本次探测不做保护：%s", e)
+
+    keep = {"flag": False}
+    try:
+        yield lambda: keep.__setitem__("flag", True)
+    finally:
+        if saved is not None and not keep["flag"]:
+            try:
+                from mootdx import config as _cfg2
+                _cfg2.set("BESTIP", saved)
+            except Exception as e:
+                logger.debug("恢复 mootdx BESTIP 失败：%s", e)
+
+
 def _get_mootdx_client():
     """Lazy-init 健壮版 mootdx Quotes client（TCP 连接，可复用）。
 
-    规避 mootdx 0.11.x 全新安装的 BESTIP 空串 bug：先 TCP 探测内置服务器列表、
-    用第一个可达的显式 server 绕过 BESTIP；三级 fallback（bestip 测速 → 裸 factory →
-    明确 RuntimeError）保证 IP 老化/换网/老用户场景都能工作。
+    选服务器的顺序：内置服务器表（TCP 预筛 + 真实取数验证）→ bestip 测速 →
+    裸 factory（老用户 config 里已有 IP）。每一级都必须真正取到数据才会被采用，
+    避免把 client 钉死在一台"端口开着但协议不通"的服务器上（#90）。
+    全部失败时抛 RuntimeError，并在 `_MOOTDX_RETRY_AFTER_S` 内直接快速失败，
+    不再逐台重探。
     """
-    global _mootdx_client
+    global _mootdx_client, _mootdx_unavailable_until
     if _mootdx_client is not None:
         return _mootdx_client
 
+    now = time.time()
+    if now < _mootdx_unavailable_until:
+        raise RuntimeError(
+            "mootdx 通达信服务器暂不可用（%.0f 秒内不再重试）。"
+            "已尝试全部内置服务器：端口能连上的也没能完成通达信协议取数。"
+            "请检查网络环境（代理/防火墙/公司网络常拦 TCP 7709），"
+            "或改用 6 位股票代码直接查询。" % (_mootdx_unavailable_until - now)
+        )
+
     from mootdx.quotes import Quotes
 
-    for ip, port in _TDX_SERVERS:
-        if _probe_tdx(ip, port):
-            _mootdx_client = Quotes.factory(market="std", server=(ip, port))
-            return _mootdx_client
+    tcp_ok_but_dead = 0
+    # 探测会覆写 mootdx 的持久化配置——包在这里，只有真选出可用服务器时才 keep()，
+    # 其余每条退出路径（含异常）都自动还原。
+    with _preserve_mootdx_bestip() as keep_bestip:
+        # TCP 预筛并发跑：38 台里多数是"连都连不上"，串行每台要等满超时（实测整轮
+        # 73.7s，首次调用像卡死）。预筛纯粹是等 IO，并发不改变选取语义——下面仍按
+        # 原顺序、逐台做真实取数验证，精选表依旧优先。
+        reachable = _reachable_tdx_servers(_candidate_tdx_servers())
+
+        for ip, port in reachable:
+            # 「TCP 通但通达信协议不通」有两种表现：factory 建连时握手就被拒，
+            # 或者建出来了但取不到数。**两种都要算**——只统计后者的话，计数永远是 0
+            # （实测这批服务器全是在 factory 里抛 ConnectionReset），下面的快速失败
+            # 判断就失效了。
+            try:
+                candidate = Quotes.factory(market="std", server=(ip, port))
+            except Exception as e:
+                tcp_ok_but_dead += 1
+                logger.debug("mootdx %s:%s 握手失败（%s），换下一台", ip, port, type(e).__name__)
+            else:
+                if _tdx_client_works(candidate):
+                    logger.info("mootdx server selected: %s:%s", ip, port)
+                    keep_bestip()   # 这次的覆写正是我们想要的，别还原
+                    _mootdx_client = candidate
+                    return _mootdx_client
+                tcp_ok_but_dead += 1
+                logger.debug("mootdx %s:%s 建连成功但取不到数，换下一台", ip, port)
+
+    # 走到这里说明逐台探测都没成——上面的 with 已经把 BESTIP 还原成用户原本的配置，
+    # 下面的裸 factory 读的正是它，这个兜底才有意义。
+    # ⚠️ 刻意**不用** `bestip=True`：它会把整张主机表做一遍测速，实测要几分钟。
+    # `_candidate_tdx_servers()` 已经把 mootdx 自带的完整主机表逐台验证过了，
+    # 覆盖面不比 bestip 差，而且每台都是"真取到数才算通过"。
     try:
-        _mootdx_client = Quotes.factory(market="std", bestip=True)  # fallback 1
-        return _mootdx_client
-    except Exception:
-        pass
-    try:
-        _mootdx_client = Quotes.factory(market="std")  # fallback 2（老用户 config 已有 IP）
-        return _mootdx_client
+        candidate = Quotes.factory(market="std")
     except Exception as e:
-        raise RuntimeError(
-            "mootdx 通达信服务器均不可达（TCP 7709）。海外网络通常全部超时，"
-            "请走国内代理或直接使用 6 位股票代码。原始错误：%s" % e
-        ) from e
+        logger.debug("mootdx 裸 factory 失败 — %s", e)
+    else:
+        if _tdx_client_works(candidate):
+            logger.info("mootdx client from 裸 factory（用户已有配置）")
+            _mootdx_client = candidate
+            return _mootdx_client
+
+    _mootdx_unavailable_until = time.time() + _MOOTDX_RETRY_AFTER_S
+    if tcp_ok_but_dead:
+        # 说清楚是"协议被拒"而不是"连不上"——这两者的排查方向完全不同。
+        cause = (
+            "%d 台服务器端口能连上，但通达信协议握手/取数被拒。"
+            "这通常是协议层被拦（代理、防火墙、公司网络对 TCP 7709 的策略），"
+            "换服务器解决不了。" % tcp_ok_but_dead
+        )
+    else:
+        cause = "内置服务器表里没有一台的 TCP 7709 能连上，请检查网络连通性。"
+    raise RuntimeError(
+        "mootdx 通达信服务器不可用：%s"
+        "可改用 6 位股票代码直接查询。%.0f 秒内将直接快速失败、不再逐台重探。"
+        % (cause, _MOOTDX_RETRY_AFTER_S)
+    )
+
+
+def _mootdx_call(method: str, **kwargs):
+    """调用 mootdx 的某个方法，失败就弃用当前服务器。
+
+    选中的服务器随时可能挂掉；不弃用的话单例会一直指着它，之后每次取数都失败降级
+    且永不重选（#90 的「反复降级」）。取 client 本身失败时不清缓存——那条路径已经
+    在 `_get_mootdx_client` 里做了负缓存，清掉等于取消快速失败。
+    """
+    client = _get_mootdx_client()
+    try:
+        return getattr(client, method)(**kwargs)
+    except Exception:
+        reset_mootdx_client()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -287,23 +556,6 @@ _EM_SESSION.headers.update({"User-Agent": _UA})
 _EM_MIN_INTERVAL = float(os.environ.get("EM_MIN_INTERVAL", "1.0"))
 _em_last_call = [0.0]  # 模块级上次东财请求时间戳
 _EM_LOCK = threading.Lock()  # 节流时间戳无线程保护 → 锁内 sleep+请求，东财调用全局串行
-# mootdx client 是模块级单例 TCP 连接（_get_mootdx_client），非线程安全；
-# 并发扫描（screener 线程池）共用一条连接会交错收发 → 所有 client 调用点串行化。
-_MOOTDX_LOCK = threading.Lock()
-# 熔断：mootdx 故障（超时/空数据，常见于周末/海外网络）后冷却期内跳过直连，
-# 避免批量扫描时每票串行支付 ~16s 超时。冷却 300s 后自动重试。
-_MOOTDX_DEAD_UNTIL = [0.0]
-_MOOTDX_BREAKER_TTL = 300.0
-
-
-def _mootdx_alive() -> bool:
-    return time.time() >= _MOOTDX_DEAD_UNTIL[0]
-
-
-def _trip_mootdx_breaker() -> None:
-    _MOOTDX_DEAD_UNTIL[0] = time.time() + _MOOTDX_BREAKER_TTL
-
-
 def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
     """东财统一请求入口：自动节流 + 复用 session + 默认 UA。
 
@@ -533,42 +785,30 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
             return data[data["Date"] <= cutoff]
 
     # Fetch from mootdx — 800 daily bars (~3 years of trading days)
-    df = None
-    if _mootdx_alive():
-        try:
-            client = _get_mootdx_client()
-            with _MOOTDX_LOCK:
-                raw = client.bars(symbol=code, category=4, offset=800)
-        except Exception as e:
-            _trip_mootdx_breaker()
-            logger.warning("mootdx OHLCV failed for %s: %s (熔断%ds, 直连sina)",
-                           code, e, _MOOTDX_BREAKER_TTL)
-            raw = None
+    try:
+        df = _mootdx_call("bars", symbol=code, category=4, offset=800)
 
-        if raw is not None and not raw.empty:
-            # mootdx returns index named 'datetime' AND a column named 'datetime'
-            # (plus year/month/day/hour/minute/volume). Drop duplicates before reset.
-            df = raw.drop(columns=["datetime", "year", "month", "day", "hour", "minute"], errors="ignore")
-            df = df.reset_index()  # moves index 'datetime' → column 'datetime'
-            rename_map = {
-                "datetime": "Date",
-                "open": "Open",
-                "close": "Close",
-                "high": "High",
-                "low": "Low",
-                "volume": "Volume",
-            }
-            df = df.rename(columns=rename_map)
-            df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-            df = _normalize_ohlcv_dates(df)
-        else:
-            # 空数据视同故障（超时无异常返回None是 mootdx 典型失败模式）
-            _trip_mootdx_breaker()
-            logger.warning("mootdx OHLCV empty for %s (熔断%ds, 直连sina)",
-                           code, _MOOTDX_BREAKER_TTL)
+        if df is None or df.empty:
+            raise ValueError(f"No OHLCV data from mootdx for {code}")
 
-    if df is None or df.empty:
-        # Fallback: Sina direct HTTP API（mootdx 故障/熔断中）
+        # mootdx returns index named 'datetime' AND a column named 'datetime'
+        # (plus year/month/day/hour/minute/volume). Drop duplicates before reset.
+        df = df.drop(columns=["datetime", "year", "month", "day", "hour", "minute"], errors="ignore")
+        df = df.reset_index()  # moves index 'datetime' → column 'datetime'
+        rename_map = {
+            "datetime": "Date",
+            "open": "Open",
+            "close": "Close",
+            "high": "High",
+            "low": "Low",
+            "volume": "Volume",
+        }
+        df = df.rename(columns=rename_map)
+        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        df = _normalize_ohlcv_dates(df)
+    except Exception as e:
+        logger.warning("mootdx OHLCV failed for %s: %s, trying sina HTTP fallback", code, e)
+        # Fallback: Sina direct HTTP API
         try:
             df = _sina_kline_fallback(code)
             if df.empty:
@@ -603,43 +843,34 @@ def get_stock_data(
     code = _normalize_ticker(symbol)
 
     data_source = "mootdx (TCP)"
-    df = None
-    if _mootdx_alive():
-        try:
-            client = _get_mootdx_client()
-            with _MOOTDX_LOCK:
-                df = client.bars(symbol=code, category=4, offset=800)
+    try:
+        df = _mootdx_call("bars", symbol=code, category=4, offset=800)
 
-            if df is None or df.empty:
-                raise ValueError(f"No data from mootdx for {code}")
+        if df is None or df.empty:
+            raise ValueError(f"No data from mootdx for {code}")
 
-            # Drop duplicate datetime column + extra columns before reset_index
-            df = df.drop(
-                columns=["datetime", "year", "month", "day", "hour", "minute"],
-                errors="ignore",
-            )
-            df = df.reset_index()  # index 'datetime' → column 'datetime'
-            df = df.rename(
-                columns={
-                    "datetime": "Date",
-                    "open": "Open",
-                    "close": "Close",
-                    "high": "High",
-                    "low": "Low",
-                    "volume": "Volume",
-                    "amount": "Amount",
-                }
-            )
-            df = _normalize_ohlcv_dates(df)
+        # Drop duplicate datetime column + extra columns before reset_index
+        df = df.drop(
+            columns=["datetime", "year", "month", "day", "hour", "minute"],
+            errors="ignore",
+        )
+        df = df.reset_index()  # index 'datetime' → column 'datetime'
+        df = df.rename(
+            columns={
+                "datetime": "Date",
+                "open": "Open",
+                "close": "Close",
+                "high": "High",
+                "low": "Low",
+                "volume": "Volume",
+                "amount": "Amount",
+            }
+        )
+        df = _normalize_ohlcv_dates(df)
 
-        except Exception as e:
-            _trip_mootdx_breaker()
-            logger.warning("mootdx K-line failed for %s: %s (熔断%ds), trying sina HTTP fallback",
-                           code, e, _MOOTDX_BREAKER_TTL)
-            df = None
-
-    if df is None or df.empty:
-        # Fallback: Sina direct HTTP API（mootdx 故障/熔断中）
+    except Exception as e:
+        logger.warning("mootdx K-line failed for %s: %s, trying sina HTTP fallback", code, e)
+        # Fallback: Sina direct HTTP API
         try:
             df = _sina_kline_fallback(code, start_date, end_date)
             if df.empty:
@@ -700,7 +931,6 @@ _INDICATOR_DESCRIPTIONS = {
     "vwma": "VWMA: Volume-weighted moving average.",
     "mfi": "MFI: Money Flow Index (volume + price momentum).",
 }
-
 
 def get_indicators(
     symbol: Annotated[str, "A-stock code"],
@@ -773,6 +1003,10 @@ def get_fundamentals(
 
     try:
         lines = []
+        # 腾讯行情只有"此刻"的 PE/PB/市值，拿不到历史时点值。复盘历史日期时
+        # 必须明说，否则模型会把今天的估值写成分析日当天的事实（未来函数）。
+        if _is_historical(curr_date):
+            lines.append(_snapshot_notice(curr_date, "估值与行情数据"))
 
         # --- Tencent: real-time valuation ---
         try:
@@ -799,9 +1033,7 @@ def get_fundamentals(
 
         # --- mootdx: financial snapshot (quarterly) ---
         try:
-            client = _get_mootdx_client()
-            with _MOOTDX_LOCK:
-                fin = client.finance(symbol=code)
+            fin = _mootdx_call("finance", symbol=code)
             if fin is not None and not (
                 isinstance(fin, pd.DataFrame) and fin.empty
             ):
@@ -1007,7 +1239,7 @@ def _get_financial_report_sina(
 
     # 这个接口的财报在 data.report_list{报告期: {publish_date, update_time, ...,
     # data: [{item_title, item_value}]}} 里；v0.2.5 起的解析只认 data.<fzb|lrb|llb>
-    # 行列表，三张财报表因此一直静默返回空表（"No balance sheet data found"，上游 #116）。
+    # 行列表，三张财报表因此一直静默返回空表（"No balance sheet data found"，#116）。
     # 行列表的写法保留兼容。
     if not isinstance(items, list) or not items:
         report_list = result.get("report_list")
@@ -1047,11 +1279,19 @@ def _get_financial_report_sina(
     # Filter by curr_date：报告期在分析日之前还不够，财报还得在分析日之前已经公布。
     # 例：分析日 07-15 时 06-30 的半年报要到 8 月才公布，只按报告期筛会提前看到它。
     # 新浪每期给两个日期，都不会早于这期数字公布的时间，但都可能被后来的报表改写：
-    # publish_date 是最近一次刊出这期数字的报表日期，update_time 是入库 / 最近改数的时间。
-    # - 公告日早于分析日，或入库时间早于分析日当天 → 已公布；
-    # - 两个日期都晚于报告期一年以上（或都没有，如行列表）→ 原始公布日已被改写丢失，按法定截止日判断。
-    # - 新浪 2020-03-13 全市场批量入库，之前的各期共用该入库时间；只认这一天、且 3 期及以上共用。
-    # - 公告日不晚于报告期的不可信，当作没有。
+    # publish_date 是最近一次刊出这期数字的报表日期（次年同期报表把它当对比数再刊出
+    # 时会改写），update_time 是入库 / 最近改数的时间（多数是公布前一晚）。所以：
+    # - 公告日早于分析日，或入库时间早于分析日当天 → 已公布（公告日当天收盘后才发的也有，
+    #   所以要严格早于）；
+    # - 两个日期都晚于报告期一年以上（或都没有，如行列表）→ 原始公布日已被改写丢失，只能
+    #   假定按时披露，过了法定截止日才算已公布。逾期披露的公司两个日期都还在一年内，
+    #   不走这条，否则截止日一过就提前看到它还没发的财报。
+    # - 新浪 2020-03-13 给全市场做过一次批量入库，之前的各期共用这一个入库时间（茅台利润表
+    #   76 期）。它能证明这些期那时已公布，但不是原始入库时间，判断原始日期是否丢失时不算数，
+    #   否则 2019 年前三季的报表要到 2020-03-14 才放行。只认这一天、且 3 期及以上共用：
+    #   正常情况下共用同一入库时间的最多两期（年报和一季报同一天发、重述对比数）；别的日期
+    #   多期共用可能是逾期公司一次补发几期，按截止日放行会提前露出，宁可等入库时间。
+    # - 公告日不晚于报告期的（上市前的数据有写成报告期当天的）不可信，当作没有。
     if curr_date:
         if "报告日" not in df.columns:
             logger.warning(
@@ -1527,9 +1767,7 @@ def get_insider_transactions(
     code = _normalize_ticker(ticker)
 
     try:
-        client = _get_mootdx_client()
-        with _MOOTDX_LOCK:
-            text = client.F10(symbol=code, name="股东研究")
+        text = _mootdx_call("F10", symbol=code, name="股东研究")
 
         # mootdx 故障时 F10 可能返回 dict（错误信息）而非 str → 防御性类型检查
         if not isinstance(text, str) or not text.strip():
@@ -1569,7 +1807,7 @@ def get_insider_transactions(
 
 def get_profit_forecast(
     ticker: Annotated[str, "A-stock code"],
-    curr_date: Annotated[str, "current date (unused, for interface compat)"] = None,
+    curr_date: Annotated[str, "current date — 用于判断是否在复盘历史"] = None,
 ) -> str:
     """Get consensus EPS forecasts with forward valuation (同花顺 direct HTTP)."""
     code = _normalize_ticker(ticker)
@@ -1586,6 +1824,9 @@ def get_profit_forecast(
             f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
         ]
+        # 一致预期是"当前"的分析师预测，没有历史时点版本。同上，必须明说。
+        if _is_historical(curr_date):
+            lines.insert(0, _snapshot_notice(curr_date, "分析师一致预期"))
 
         eps_by_year = {}
         for _, row in df.iterrows():
@@ -1939,12 +2180,12 @@ def get_concept_blocks(
     code = _normalize_ticker(ticker)
 
     try:
-        url = (
-            "https://finance.pae.baidu.com/api/getrelatedblock"
-            f'?stock=[{{"code":"{code}","market":"ab","type":"stock"}}]'
-            "&finClientType=pc"
-        )
-        r = requests.get(url, headers=_BAIDU_PAE_HEADERS, timeout=10)
+        url = "https://finance.pae.baidu.com/api/getrelatedblock"
+        params = {
+            "stock": f'[{{"code":"{code}","market":"ab","type":"stock"}}]',
+            "finClientType": "pc",
+        }
+        r = requests.get(url, params=params, headers=_BAIDU_PAE_HEADERS, timeout=10)
         d = r.json()
 
         if str(d.get("ResultCode", -1)) != "0":
@@ -1954,6 +2195,16 @@ def get_concept_blocks(
             )
 
         result = d.get("Result", {})
+        # 百度风控会回 HTTP 403 + {"ResultCode": 0(整数), "Result": {"code": 403,
+        # "isCaptchaEnabled": true, "msg": "hit risk"}}。外层 ResultCode 是**整数** 0，
+        # 上面那句 str() 比较放它过关，于是被风控当成"该股没有概念板块"——一个错的事实
+        # 喂给模型。这里必须单独识别，把失败如实报出来。
+        if isinstance(result, dict) and result.get("code") == 403:
+            return (
+                f"Baidu PAE 风控拦截（hit risk），{code} 的概念板块本次取不到。"
+                "该接口会对 python-requests 的 TLS 指纹做风控（同一时刻 curl 正常），"
+                "需 curl_cffi 浏览器指纹伪装才能稳定取数。"
+            )
         categories = result.get(code, [])
         if not categories:
             return f"No concept/block data for {code}"
@@ -2018,6 +2269,14 @@ def get_fund_flow(
         "",
     ]
 
+    historical = _is_historical(curr_date)
+    if historical:
+        # 分钟级资金流只有"今天"的，复盘历史日期时整段都是未来数据，直接不取。
+        lines.append(
+            f"（分析日期 {curr_date} 早于今天，已略去实时分钟资金流——"
+            f"那是今天的盘中数据，不是 {curr_date} 当天的。）\n"
+        )
+
     try:
         # Realtime minute-level fund flow
         url_rt = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
@@ -2026,9 +2285,11 @@ def get_fund_flow(
             "fields1": "f1,f2,f3,f7",
             "fields2": "f51,f52,f53,f54,f55,f56,f57",
         }
-        r = _em_get(url_rt, params=params_rt, timeout=10)
-        d = r.json()
-        klines = d.get("data", {}).get("klines", [])
+        klines = []
+        if not historical:
+            r = _em_get(url_rt, params=params_rt, timeout=10)
+            d = r.json()
+            klines = d.get("data", {}).get("klines", [])
 
         if klines:
             lines.append(
@@ -2070,8 +2331,18 @@ def get_fund_flow(
                 "https://push2his.eastmoney.com"
                 "/api/qt/stock/fflow/daykline/get"
             )
+            # 接口返回的是"从今天回溯 lmt 个交易日"，没有 end_date 参数。复盘一个
+            # 较早的日期时，若仍只要 20 天，过滤后会**一行不剩**——把"数据不对"
+            # 变成"没有数据"，比不过滤更糟。按分析日与今天的间隔把窗口放大到能
+            # 覆盖到那一段（上限 500，够回溯约两年）。
+            hist_limit = 20
+            if historical:
+                gap_days = (_market_today() - datetime.strptime(
+                    str(curr_date)[:10], "%Y-%m-%d").date()).days
+                # 日历日 → 交易日约 ×0.7，再多留 20 天余量
+                hist_limit = min(500, 20 + int(gap_days * 0.7) + 20)
             params_hist = {
-                "secid": secid, "lmt": 20, "klt": 101,
+                "secid": secid, "lmt": hist_limit, "klt": 101,
                 "fields1": "f1,f2,f3,f7",
                 "fields2": "f51,f52,f53,f54,f55,f56,f57",
             }
@@ -2079,10 +2350,31 @@ def get_fund_flow(
             dh = rh.json()
             hist_klines = dh.get("data", {}).get("klines", [])
 
-            if hist_klines:
+            # 逐行按分析日截断：接口返回的是"从今天回溯 20 个交易日"，
+            # 在历史日期上直接打印等于把未来的资金流喂给模型（未来函数）。
+            if historical:
+                cutoff = str(curr_date)[:10]
+                hist_klines = [
+                    k for k in hist_klines if k.split(",")[0][:10] <= cutoff
+                ]
+                # 窗口是为了"够回溯到分析日"才放大的，过滤完要裁回承诺的 20 个交易日。
+                # 不裁的话，复盘 90 天前会返回约 40 行——既改变了请求的趋势窗口，
+                # 又把每次情绪工具的返回体撑大一倍。
+                hist_klines = hist_klines[-20:]
+
+            if historical and not hist_klines:
+                # 说清楚是"这个日期取不到"，而不是让正文里凭空少一段
+                lines.append(
+                    f"\n## Historical Daily Fund Flow\n"
+                    f"（{str(curr_date)[:10]} 及之前的资金流未能取到：该接口只提供"
+                    f"从今天回溯的窗口，分析日过早时可能已超出可回溯范围。）"
+                )
+            elif hist_klines:
                 lines.append(
                     f"\n## Historical Daily Fund Flow "
-                    f"(last {len(hist_klines)} trading days)"
+                    f"(last {len(hist_klines)} trading days"
+                    + (f", 截至 {str(curr_date)[:10]}" if historical else "")
+                    + ")"
                 )
                 lines.append(
                     "Date | 主力净流入(万) | 大单(万) "
@@ -2223,7 +2515,7 @@ def get_dragon_tiger_board(
         Formatted text with LHB appearances, top buyer/seller seats,
         and institutional activity.
     """
-    code = safe_ticker_component(ticker)
+    code = _normalize_ticker(ticker)
     end_dt = datetime.strptime(trade_date, "%Y-%m-%d")
     start_dt = end_dt - pd.Timedelta(days=look_back_days)
     start_date_str = start_dt.strftime("%Y-%m-%d")
@@ -2435,7 +2727,7 @@ def get_lockup_expiry(
         Formatted text with historical unlock records and upcoming
         expiry calendar with impact metrics.
     """
-    code = safe_ticker_component(ticker)
+    code = _normalize_ticker(ticker)
     lines = [f"# 限售解禁日历 | {code} | {trade_date}"]
 
     # 1. 历史解禁记录 — eastmoney datacenter direct HTTP
@@ -2516,7 +2808,7 @@ def get_industry_comparison(
         Formatted text with sector performance ranking, highlighting
         the sector the target stock belongs to.
     """
-    code = safe_ticker_component(ticker)
+    code = _normalize_ticker(ticker)
     lines = [f"# 行业横向对比 | {code} | {trade_date}"]
 
     # 东财 push2 行业板块排名 (direct HTTP, replaces 同花顺 which has 401)
